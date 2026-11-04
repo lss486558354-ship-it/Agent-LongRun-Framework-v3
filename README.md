@@ -21,6 +21,10 @@ execution and memory are each other's precondition.
 > *may this turn touch files*. Conversation and execution are physically separated,
 > so the agent cannot keep editing after the approval expires.
 
+![agent-longrun demo](docs/demo.gif)
+
+*`agent-longrun demo` — read-only → lease → checkpoint → resume → stale lease rejected → finish.*
+
 Not another agent framework. No LLM calls, no orchestration DSL. It is a thin
 layer that answers three questions an agent runtime keeps getting wrong:
 
