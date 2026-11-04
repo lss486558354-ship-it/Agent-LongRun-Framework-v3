@@ -1,0 +1,61 @@
+name: Bug report
+  description: Report a reproducible problem with install, demo, checkpoint, resume, or the write lease.
+  title: "[bug] "
+  labels: ["bug"]
+  body:
+    - type: input
+      id: version
+      attributes:
+        label: Version / commit
+        placeholder: v0.3.0 or commit hash
+      validations:
+        required: true
+
+    - type: dropdown
+      id: area
+      attributes:
+        label: Area
+        options:
+          - install / packaging
+          - state machine / transitions
+          - single-turn write lease
+          - checkpoint / resume / recover
+          - MCP memory router
+          - demo CLI
+          - docs
+      validations:
+        required: true
+
+    - type: textarea
+      id: steps
+      attributes:
+        label: Reproduction steps
+        placeholder: |
+          1. python -m venv .venv
+          2. pip install ...
+          3. agent-longrun demo
+      validations:
+        required: true
+
+    - type: textarea
+      id: expected
+      attributes:
+        label: Expected behavior
+      validations:
+        required: true
+
+    - type: textarea
+      id: actual
+      attributes:
+        label: Actual behavior / traceback
+        render: shell
+      validations:
+        required: true
+
+    - type: input
+      id: env
+      attributes:
+        label: Environment
+        placeholder: OS, Python version, install method
+      validations:
+        required: true
