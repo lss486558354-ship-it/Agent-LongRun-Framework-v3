@@ -41,8 +41,10 @@ class TaskStatus(str, Enum):
 class AccessMode(str, Enum):
     """读写门禁。
 
-    READ_ONLY    调研 / 规划 / 读历史。可以查记忆，但不能改代码。
-    WRITABLE     实施阶段。只有显式调用 enable_writes() 才会进入。
+    READ_ONLY    对话态 / 调研 / 规划 / 读历史。可以查记忆，但不能改代码。
+    WRITABLE     执行态。只有显式调用 enable_writes() 才会进入，
+                 且只在当前 turn_index 内有效；下一轮对话、checkpoint
+                 或 resume 都会把它收回 READ_ONLY。
     """
 
     READ_ONLY = "read_only"
@@ -96,10 +98,12 @@ def now_iso() -> str:
 class TaskState:
     """一个长任务的完整状态。
 
-    字段分三类：
+    字段分四类：
     1. 身份：task_id / description / created_at
     2. 执行：status / access_mode / phase / completed_steps / next_step
-    3. 记忆：decisions / checkpoint_id / checkpoint_memory_ids
+    3. 对话边界：turn_index / write_lease_turn
+       —— 写权限是「单轮租约」，不是持久开关；换轮即失效。
+    4. 记忆：decisions / checkpoint_id / checkpoint_memory_ids
 
     `checkpoint_memory_ids` 保存所有断点记忆的 ID。恢复时先看最新的那条，
     但保留全部 ID 是为了让 Agent 能按需回溯更早的断点。
@@ -109,6 +113,10 @@ class TaskState:
     description: str
     status: TaskStatus = TaskStatus.PENDING
     access_mode: AccessMode = AccessMode.READ_ONLY
+    # 对话轮次。每次 begin_turn / resume / recover_from_memory 递增。
+    turn_index: int = 0
+    # 写租约绑定的轮次。只有 write_lease_turn == turn_index 时 writable 才有效。
+    write_lease_turn: int | None = None
     phase: str = "研究"
     completed_steps: list[str] = field(default_factory=list)
     decisions: list[str] = field(default_factory=list)
@@ -167,6 +175,8 @@ class TaskState:
             "description": self.description,
             "status": self.status.value,
             "access_mode": self.access_mode.value,
+            "turn_index": self.turn_index,
+            "write_lease_turn": self.write_lease_turn,
             "phase": self.phase,
             "completed_steps": list(self.completed_steps),
             "decisions": list(self.decisions),
@@ -179,12 +189,18 @@ class TaskState:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "TaskState":
+    def from_dict(cls, data: dict[str, Any]) -> TaskState:
         return cls(
             task_id=str(data["task_id"]),
             description=str(data.get("description", "")),
             status=TaskStatus(data.get("status", "pending")),
             access_mode=AccessMode(data.get("access_mode", "read_only")),
+            turn_index=int(data.get("turn_index", 0) or 0),
+            write_lease_turn=(
+                None
+                if data.get("write_lease_turn") is None
+                else int(data["write_lease_turn"])
+            ),
             phase=str(data.get("phase", "研究")),
             completed_steps=list(data.get("completed_steps") or []),
             decisions=list(data.get("decisions") or []),

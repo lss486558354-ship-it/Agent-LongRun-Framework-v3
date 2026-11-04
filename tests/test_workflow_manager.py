@@ -11,11 +11,13 @@
 from __future__ import annotations
 
 import json
+import types
 
 import pytest
 
+import memory_client
 from memory_client import InMemoryBackend, MCPMemoryBackend, MemoryBackendError
-from state_machine import AccessMode, StateStore, TaskStatus
+from state_machine import AccessMode, StateStore, TaskState, TaskStatus
 from workflow_manager import (
     CheckpointError,
     CheckpointWriteError,
@@ -109,6 +111,8 @@ def test_start_task_defaults_to_read_only(agent) -> None:
     result = start(agent)
 
     assert result.state.access_mode is AccessMode.READ_ONLY
+    assert result.state.turn_index == 1
+    assert result.state.write_lease_turn is None
     assert "enable_writes" in result.summary
 
 
@@ -138,6 +142,8 @@ def test_checkpoint_pauses_and_persists(agent, tmp_path) -> None:
     assert reloaded is not None
     assert reloaded.status is TaskStatus.PAUSED
     assert reloaded.next_step == "下一步"
+    assert reloaded.access_mode is AccessMode.READ_ONLY
+    assert reloaded.write_lease_turn is None
     assert reloaded.checkpoint_id
 
 
@@ -150,12 +156,16 @@ def test_checkpoint_content_contains_machine_marker(agent) -> None:
     marker = checkpoint.text.split("<!-- longrun-state: ")[1].split(" -->")[0]
     data = json.loads(marker)
     assert data["task_id"] == checkpoint.state.task_id
-    assert data["access_mode"] == "writable"
+    # v3：断点结束本轮执行，写租约在渲染前已被收回。
+    assert data["access_mode"] == "read_only"
+    assert data["write_lease_turn"] is None
+    assert data["turn_index"] == 1
     assert "history" not in data
 
 
 def test_checkpoint_write_failure_blocks_output(agent, memory, tmp_path) -> None:
     start(agent)
+    agent.enable_writes("准备写入")
     failing = FailingSaveBackend()
     failing.entities = memory.entities
     failing.raw = memory.raw
@@ -166,9 +176,10 @@ def test_checkpoint_write_failure_blocks_output(agent, memory, tmp_path) -> None
     with pytest.raises(CheckpointWriteError, match="断点未输出"):
         agent.checkpoint(reason="token 预警", next_step="继续")
 
-    # 状态没有被推进，断点文本也没有返回
+    # 状态没有被推进，断点文本也没有返回；写权限同样被收回
     assert agent.status()["status"] == "in_progress"
     assert agent.status()["checkpoint_id"] is None
+    assert agent.status()["access_mode"] == "read_only"
     assert (tmp_path / ".longrun" / "pending_checkpoint.json").exists()
 
 
@@ -207,17 +218,18 @@ def test_terminal_task_can_be_replaced(agent) -> None:
 def test_read_only_blocks_writes(agent) -> None:
     start(agent)
 
-    with pytest.raises(WriteGateViolation, match="只读模式"):
+    with pytest.raises(WriteGateViolation, match="只读"):
         agent.require_writable("修改报价适配器")
 
 
 def test_enable_writes_unlocks(agent) -> None:
     start(agent)
 
-    agent.enable_writes("方案已确认")
+    state = agent.enable_writes("方案已确认")
     agent.require_writable("修改报价适配器")  # 不应抛异常
 
-    assert agent.status()["access_mode"] == "writable"
+    assert state.access_mode is AccessMode.WRITABLE
+    assert state.write_lease_turn == state.turn_index == 1
     assert "方案已确认" in agent.status()["history"][-1]["reason"]
 
 
@@ -226,8 +238,85 @@ def test_disable_writes_relocks(agent) -> None:
     agent.enable_writes("开始实施")
     agent.disable_writes("回到调研")
 
+    assert agent.status()["write_lease_turn"] is None
     with pytest.raises(WriteGateViolation):
         agent.require_writable()
+
+
+def test_begin_turn_revokes_previous_lease(agent) -> None:
+    start(agent)
+    agent.enable_writes("方案确认")
+    agent.require_writable("第一轮写文件")
+
+    state = agent.begin_turn("用户发来下一条消息")
+
+    assert state.turn_index == 2
+    assert state.access_mode is AccessMode.READ_ONLY
+    assert state.write_lease_turn is None
+    with pytest.raises(WriteGateViolation, match="只读"):
+        agent.require_writable("第二轮写文件")
+
+    agent.enable_writes("第二轮方案也确认")
+    agent.require_writable("第二轮写文件")
+    assert agent.status()["write_lease_turn"] == 2
+
+
+def test_end_turn_revokes_lease(agent) -> None:
+    start(agent)
+    agent.enable_writes("方案确认")
+
+    state = agent.end_turn("本轮结束")
+
+    assert state.turn_index == 1
+    assert state.access_mode is AccessMode.READ_ONLY
+    assert state.write_lease_turn is None
+    with pytest.raises(WriteGateViolation):
+        agent.require_writable("本轮结束后的写操作")
+
+
+def test_stale_lease_is_rejected_even_if_mode_is_writable(agent) -> None:
+    start(agent)
+    agent.enable_writes("方案确认")
+
+    # 模拟外部把状态文件改成 writable、但轮次已经前进的异常情况。
+    agent._state.turn_index += 1  # type: ignore[union-attr]
+
+    with pytest.raises(WriteGateViolation, match="已过期"):
+        agent.require_writable("写文件")
+
+
+def test_checkpoint_revokes_lease_before_persisting(agent, tmp_path) -> None:
+    start(agent)
+    agent.enable_writes("方案确认")
+
+    checkpoint = agent.checkpoint(reason="token 预警", next_step="继续")
+
+    assert checkpoint.state.access_mode is AccessMode.READ_ONLY
+    assert checkpoint.state.write_lease_turn is None
+    reloaded = StateStore(tmp_path).load()
+    assert reloaded is not None
+    assert reloaded.access_mode is AccessMode.READ_ONLY
+    assert reloaded.write_lease_turn is None
+
+
+def test_legacy_writable_state_is_revoked_on_load(tmp_path, memory) -> None:
+    store = StateStore(tmp_path)
+    state = TaskState(
+        task_id="T_OLD",
+        description="v2 遗留任务",
+        access_mode=AccessMode.WRITABLE,
+        turn_index=1,
+        write_lease_turn=1,
+    )
+    state.transition(TaskStatus.IN_PROGRESS)
+    store.save(state)
+
+    agent = LongRunAgent(memory, root=tmp_path)
+
+    assert agent.status()["access_mode"] == "read_only"
+    assert agent.status()["write_lease_turn"] is None
+    with pytest.raises(WriteGateViolation):
+        agent.require_writable("旧状态直接写")
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +332,8 @@ def test_complete_phase_keeps_task_running(agent, memory) -> None:
     )
 
     assert checkpoint.state.status is TaskStatus.IN_PROGRESS
+    assert checkpoint.state.access_mode is AccessMode.READ_ONLY
+    assert checkpoint.state.write_lease_turn is None
     assert "阶段1：数据模型: 完成建表与迁移" in checkpoint.state.completed_steps
     assert "用 SQLite 不引入 ORM" in checkpoint.state.decisions
     assert "[阶段完成]" in memory.entities[checkpoint.memory_id]["title"]
@@ -278,10 +369,17 @@ def test_resume_restores_paused_task(tmp_path, memory) -> None:
 
     assert bundle.state.task_id == checkpoint.state.task_id
     assert bundle.state.status is TaskStatus.IN_PROGRESS
-    assert bundle.state.access_mode is AccessMode.WRITABLE
+    # v3：resume 开启新一轮，上一轮的写租约不继承。
+    assert bundle.state.access_mode is AccessMode.READ_ONLY
+    assert bundle.state.write_lease_turn is None
+    assert bundle.state.turn_index == 2
     assert bundle.state.next_step == "接入第二个平台"
     assert bundle.checkpoint is not None
     assert "[LongRun Checkpoint]" in bundle.checkpoint["content"]
+
+    second.enable_writes("恢复后重新授权")
+    second.require_writable("继续修改适配器")
+    assert second.status()["write_lease_turn"] == 2
 
 
 def test_resume_without_state_raises(tmp_path, memory) -> None:
@@ -304,10 +402,15 @@ def test_recover_from_memory_rebuilds_state(tmp_path, memory) -> None:
 
     assert bundle.state.task_id == started.state.task_id
     assert bundle.state.status is TaskStatus.PAUSED
+    assert bundle.state.access_mode is AccessMode.READ_ONLY
+    assert bundle.state.write_lease_turn is None
+    assert bundle.state.turn_index == 2
     assert bundle.state.next_step == "继续实现"
     assert bundle.state.decisions == ["先做只读探测"]
     assert bundle.state.checkpoint_id == checkpoint.memory_id
     assert fresh.status()["task_id"] == started.state.task_id
+    with pytest.raises(WriteGateViolation):
+        fresh.require_writable("恢复后未授权就写")
 
 
 def test_recover_from_memory_missing_raises(tmp_path, memory) -> None:
@@ -375,6 +478,52 @@ def test_mcp_backend_rejects_missing_project(tmp_path) -> None:
 
     with pytest.raises(MemoryBackendError, match="项目目录不存在"):
         MCPMemoryBackend(server_path=server, project_path=tmp_path / "nope")
+
+
+def test_default_router_path_uses_installed_router(monkeypatch, tmp_path) -> None:
+    router = tmp_path / "site-packages" / "router"
+    router.mkdir(parents=True)
+    (router / "mcp_server.py").write_text("", encoding="utf-8")
+    (router / "memory_core.py").write_text("", encoding="utf-8")
+    spec = types.SimpleNamespace(origin=str(router / "mcp_server.py"))
+
+    monkeypatch.delenv("AGENT_MEMORY_ROUTER_PATH", raising=False)
+    monkeypatch.setattr(
+        "memory_client.importlib.util.find_spec",
+        lambda name: spec if name == "mcp_server" else None,
+    )
+
+    assert memory_client._default_router_path() == router.resolve()
+
+
+def test_default_router_path_falls_back_to_sibling(monkeypatch, tmp_path) -> None:
+    package = tmp_path / "site-packages"
+    package.mkdir()
+    module_file = package / "memory_client.py"
+    module_file.write_text("", encoding="utf-8")
+    router = tmp_path / "agent-memory-router-v2"
+    router.mkdir()
+    (router / "mcp_server.py").write_text("", encoding="utf-8")
+    (router / "memory_core.py").write_text("", encoding="utf-8")
+
+    monkeypatch.delenv("AGENT_MEMORY_ROUTER_PATH", raising=False)
+    monkeypatch.setattr("memory_client.__file__", str(module_file))
+    monkeypatch.setattr(
+        "memory_client.importlib.util.find_spec", lambda name: None
+    )
+
+    assert memory_client._default_router_path() == router.resolve()
+
+
+def test_default_router_path_env_override(monkeypatch, tmp_path) -> None:
+    router = tmp_path / "custom-router"
+    router.mkdir()
+    (router / "mcp_server.py").write_text("", encoding="utf-8")
+    (router / "memory_core.py").write_text("", encoding="utf-8")
+
+    monkeypatch.setenv("AGENT_MEMORY_ROUTER_PATH", str(router))
+
+    assert memory_client._default_router_path() == router.resolve()
 
 
 # ---------------------------------------------------------------------------

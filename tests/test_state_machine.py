@@ -87,6 +87,8 @@ def test_round_trip_preserves_values() -> None:
     state = make_state()
     state.transition(TaskStatus.IN_PROGRESS)
     state.access_mode = AccessMode.WRITABLE
+    state.turn_index = 3
+    state.write_lease_turn = 3
     state.completed_steps.append("第一步")
     state.checkpoint_memory_ids.append("S_0001")
 
@@ -94,6 +96,15 @@ def test_round_trip_preserves_values() -> None:
 
     assert restored.to_dict() == state.to_dict()
     assert restored.access_mode is AccessMode.WRITABLE
+    assert restored.turn_index == 3
+    assert restored.write_lease_turn == 3
+
+
+def test_from_dict_defaults_turn_lease_for_legacy_state() -> None:
+    restored = TaskState.from_dict({"task_id": "T_OLD", "description": "旧状态"})
+
+    assert restored.turn_index == 0
+    assert restored.write_lease_turn is None
 
 
 def test_store_save_and_load(tmp_path) -> None:

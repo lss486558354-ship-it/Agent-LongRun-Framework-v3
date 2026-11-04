@@ -7,7 +7,7 @@ Agent 在本仓库工作，或使用本框架执行任务时，必须遵守以�
 技能：`skills/auto-dev-workflow/SKILL.md`
 架构：`README.md`
 
-## 项目边界（v0.2）
+## 项目边界（v0.3）
 
 - 每个任务绑定一个**项目根**：`LongRunAgent(root=项目根)`
 - 热状态：`<项目根>/.longrun/state.json`
@@ -34,25 +34,31 @@ start_task
   → search_memory（铁律一）
   → 建立状态 in_progress / read_only
   → 调研
-  → enable_writes(原因)
+  → enable_writes(原因)          # 只对当前轮有效
   → 实施
   → checkpoint / complete_phase
+      → 收回写租约
       → 生成断点（含机器标记）
       → save_memory（铁律二）
       → 成功后才更新状态、输出断点
-  → resume：search_memory → 校验状态 → read_raw_data → 继续
+  → 下一条用户消息：begin_turn()（收回上一轮权限）
+  → resume：search_memory → 校验状态 → read_raw_data → read_only → 重新授权
 ```
 
-## 读写门禁
+## 读写门禁（单轮写租约）
 
 | 模式 | 用途 |
 |------|------|
 | `read_only`（默认） | 读取、检索、只读分析 |
-| `writable` | 改文件、删除、提交、装依赖、外部副作用 |
+| `writable` | 改文件、删除、提交、装依赖、外部副作用；**仅当前轮有效** |
 
-- `enable_writes(原因)` / `disable_writes(原因)` 显式切换
-- 写操作前必须 `require_writable(动作)`
+- `enable_writes(原因)` 把 `write_lease_turn` 绑定到当前 `turn_index`
+- `begin_turn()` / `end_turn()` / `checkpoint()` / `resume()` /
+  `recover_from_memory()` 都会收回写权限
+- 写操作前必须 `require_writable(动作)`；过期租约直接拒绝
 - 不允许绕过门禁直接调用 Write/Edit
+- 宿主必须在每条新用户消息开始时调用 `begin_turn()`；
+  `resume()` 已自带一次，不要重复调用
 
 ## 状态机
 
@@ -87,5 +93,6 @@ start_task
 - 未检索记忆就下「无历史方案」结论
 - 先输出断点再补写记忆
 - 只读模式下写文件
+- 把一次 `enable_writes()` 当成持久开关，跨轮次继续写
 - 把 A 项目的状态与 B 项目的记忆混在一起
 - 用量化描述代替可验证结果（「基本完成」不算完成）

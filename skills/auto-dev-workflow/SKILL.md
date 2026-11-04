@@ -26,8 +26,9 @@ LongRunAgent(root=项目根)
        ├─ 按需 read_raw_data
        └─ 状态 pending → in_progress，门禁 read_only
              │
-             ├─ 调研完成 → enable_writes(原因)
+             ├─ 调研完成 → enable_writes(原因)   # 只解锁当前轮
              ├─ 实施
+             ├─ 下一条用户消息 → begin_turn()    # 收回上一轮写权限
              ├─ 阶段完成 → phase-completion-archive
              ├─ 中断     → checkpoint(kind="interrupt")
              └─ 任务完成 → finish
@@ -67,7 +68,9 @@ LongRunAgent(root=项目根)
 4. **恢复执行**
    - 核对断点中的 `next_step` 与当前代码是否一致（代码可能已被改动）
    - 不一致时先说明差异，再决定沿用还是修正
-   - 恢复后第一次写操作前，让用户确认一次
+   - v3 起 `resume()` / `recover_from_memory()` 都会开启新轮次并强制 `read_only`；
+     `resume()` 已自带一次 `begin_turn`，不要重复调用
+   - 恢复后第一次写操作前，让用户确认一次，再 `enable_writes(原因)`
    - 继续按阶段执行，每个阶段结束走 SOP 2
 
 ### 失败分支
@@ -163,6 +166,7 @@ LongRunAgent(root=项目根)
 - ❌ 只写「继续做」，没写下一步和已完成
 - ❌ 恢复时跳过状态校验，直接按聊天记忆干活
 - ❌ 只读模式下改文件
+- ❌ 把一次 `enable_writes()` 当成持久开关，跨轮次继续写
 - ❌ 记忆服务报错，静默按「无历史」推进
 - ❌ 把整段正文塞进摘要，破坏冷热分离
 - ❌ 终态任务继续写断点
@@ -173,6 +177,7 @@ LongRunAgent(root=项目根)
 - [ ] 任务开始前有 `search_memory` 调用记录
 - [ ] 新任务门禁为 `read_only`
 - [ ] 写操作前调用过 `require_writable`
+- [ ] 写权限只在当前轮有效；断点/恢复/换轮后重新 `enable_writes`
 - [ ] 每个断点都有 memory_id
 - [ ] 断点含单行机器标记
 - [ ] 恢复时校验过状态机状态

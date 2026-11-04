@@ -1,59 +1,164 @@
-# Agent-LongRun-Framework v2
+# Agent-LongRun-Framework
 
-把「Agent 执行状态机」和「MCP 记忆路由」耦合成一条可中断、可恢复、可审计的长任务流水线。
+English | [简体中文](README.zh-CN.md)
 
-任务开始先查记忆 → 执行受状态机与读写门禁约束 → 中断/阶段完成时先写记忆，再输出断点。
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
+[![Tests](https://img.shields.io/badge/tests-52%20passed-brightgreen)](tests/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![MCP](https://img.shields.io/badge/MCP-stdio-6f42c1)](https://modelcontextprotocol.io)
 
-> 不是又一个 Agent 框架。没有 LLM 调用、没有编排 DSL，只有一层很薄的胶水：
-> 让「执行」和「记忆」互为前提。
+Runtime contracts for long-running LLM agents: a 7-state task machine, a
+**single-turn write lease**, and project-scoped memory — coupled so that
+execution and memory are each other's precondition.
+
+> **Core idea: an agent session works like a product review.**
+> **Conversational state (read-only)** is where you align on scope — clarify the
+> requirements, argue about the design.
+> **Execution state (writable)** is the task handoff after the plan is approved —
+> go write code, stop brainstorming.
 >
-> v2 起，状态与记忆都绑定到**当前项目根目录**：`<项目>/.longrun/` + `<项目>/memory.db`，
-> 不同项目互不串味。
+> The 7-state machine decides *talk or build*; the single-turn write lease decides
+> *may this turn touch files*. Conversation and execution are physically separated,
+> so the agent cannot keep editing after the approval expires.
 
-## 解决什么问题
+Not another agent framework. No LLM calls, no orchestration DSL. It is a thin
+layer that answers three questions an agent runtime keeps getting wrong:
 
-| 只有状态机 | 只有记忆 | 两者耦合（本框架） |
-|------------|----------|--------------------|
-| 断点存在本地，换机器就丢 | 记忆里有进度，但没人约束何时读写 | 本地热状态 + 记忆冷备份，互为恢复路径 |
-| 可以随意跳状态 | 可以随意覆盖进度 | 非法流转失败，未完成任务不可覆盖 |
-| 不记录为什么这么做 | 只记结果，不记执行边界 | 决策、阶段、门禁状态一起归档 |
+1. **What state is this task in, and is this transition legal?**
+2. **Is the agent allowed to touch files right now?**
+3. **If the process dies, where does the real progress live?**
 
-## 架构
+## Why
+
+| State machine alone | Memory alone | Coupled (this repo) |
+|---|---|---|
+| Checkpoints are local; lost on a new machine | Progress exists, but nothing constrains when it is read or written | Local hot state + cold memory backup, each a recovery path |
+| Any state can be jumped to | Any progress can be overwritten | Illegal transitions fail; unfinished work cannot be clobbered |
+| Records *what*, not *why* | Records results, not boundaries | Decisions, phases, and gate state are archived together |
+
+The core loop:
+
+```text
+start_task → search memory → work under the state machine
+          → checkpoint: save memory first, print the checkpoint second
+          → resume / recover on another process or machine
+```
+
+## The single-turn write lease (v3)
+
+v2 shipped `enable_writes()` as a persistent switch. That is the wrong default:
+the user approves **one** action, and the agent keeps writing files in every
+later turn.
+
+v3 makes write permission a lease bound to a conversation turn:
+
+- `TaskState.turn_index` tracks the current turn.
+- `enable_writes(reason)` binds `write_lease_turn` to the current turn.
+- `begin_turn()` / `end_turn()` / `checkpoint()` / `resume()` /
+  `recover_from_memory()` all revoke the lease.
+- `require_writable()` checks both `access_mode` and `write_lease_turn`; a stale
+  lease raises `WriteGateViolation` even if `access_mode` still says `writable`.
+- A legacy v2 state that was `writable` is downgraded to `read_only` on load.
+
+```python
+agent.enable_writes("plan approved")
+agent.require_writable("edit adapters/xometry.py")   # OK, turn 1
+
+agent.begin_turn("next user message")
+agent.require_writable("keep editing")               # raises WriteGateViolation
+
+agent.enable_writes("new plan approved")
+agent.require_writable("keep editing")               # OK, turn 2
+```
+
+The host is responsible for calling `begin_turn()` when a new user message
+arrives — the framework cannot see message boundaries by itself. `resume()`
+already includes one `begin_turn`; do not call it twice for the same message.
+
+## Quickstart
+
+Install the memory router and this framework straight from Git:
+
+```bash
+python -m pip install "agent-memory-router @ git+https://github.com/lss486558354-ship-it/agent-memory-router-v2.git"
+python -m pip install "agent-longrun-framework @ git+https://github.com/lss486558354-ship-it/Agent-LongRun-Framework-v3.git"
+
+agent-longrun demo
+```
+
+The demo runs the whole loop in a temp directory:
+
+```text
+start_task (read-only)
+  → enable_writes (unlocks the current turn only)
+  → checkpoint (save memory first, then print the checkpoint)
+  → new Agent resume (back to read-only, next turn)
+  → write attempt rejected: the lease did not survive resume
+  → enable_writes again
+  → finish
+```
+
+Expected final line: `OK: checkpoint -> resume -> single-turn write lease -> finish`.
+
+If `agent-longrun` is not on `PATH`, activate the virtualenv you installed into.
+
+### From source
+
+```bash
+git clone https://github.com/lss486558354-ship-it/agent-memory-router-v2.git
+git clone https://github.com/lss486558354-ship-it/Agent-LongRun-Framework-v3.git
+
+cd Agent-LongRun-Framework-v3
+python -m pip install -e ".[dev]"
+python -m pip install -e ../agent-memory-router-v2
+
+python -m pytest tests/ -q                    # 52 passed
+python examples/01_interrupted_task.py        # in-process backend
+python examples/01_interrupted_task.py --mcp  # real MCP stdio
+```
+
+The router is located in this order: `AGENT_MEMORY_ROUTER_PATH` → an installed
+`memory_core` / `mcp_server` module → a sibling directory → the current working
+directory. Both pip installs and side-by-side clones work.
+
+## Architecture
 
 ```mermaid
 flowchart LR
-    U[用户任务] --> A["LongRunAgent(root=项目根)<br/>start_task"]
+    U[Task] --> A["LongRunAgent(root=project)<br/>start_task"]
 
-    A -->|铁律一<br/>search_memory| M[("本项目 memory.db<br/>raw_data/")]
-    M -->|摘要 + 按需原文| A
+    A -->|invariant 1<br/>search_memory| M[("project memory.db<br/>raw_data/")]
+    M -->|summaries + on-demand raw text| A
 
-    A --> S[状态机<br/>in_progress / read_only]
-    S -->|调研完成<br/>enable_writes| W[状态机<br/>writable]
-    W --> X[执行阶段]
+    A --> S["state machine<br/>in_progress / read_only"]
+    S -->|plan approved<br/>enable_writes| W["state machine<br/>writable<br/>lease = current turn"]
+    W --> X[Execution]
 
-    X --> C{中断 / 阶段完成?}
-    C -->|否| X
-    C -->|是| P[checkpoint<br/>生成断点 + 机器标记]
+    X --> C{interrupt or phase done?}
+    C -->|no| X
+    C -->|yes| P["checkpoint<br/>render + machine marker"]
 
-    P -->|铁律二<br/>save_memory| M
-    M -->|成功，返回 memory_id| O[输出断点文本]
-    M -->|失败| F[写 pending_checkpoint.json<br/>不输出断点]
+    P -->|invariant 2<br/>save_memory| M
+    M -->|ok: memory_id| O[print checkpoint]
+    M -->|fail| F["write pending_checkpoint.json<br/>print nothing"]
 
     O --> R[resume / recover_from_memory]
     R --> S
 
-    S -.状态落盘.-> L[("<项目根>/.longrun/<br/>state.json")]
-    R -.本地状态丢失时.-> M
+    S -.state on disk.-> L[("<root>/.longrun/<br/>state.json")]
+    R -.local state lost.-> M
 ```
 
-`LongRunAgent(root=...)` 同时决定两件事：
+`LongRunAgent(root=...)` decides two things at once:
 
-- 热状态写到 `<root>/.longrun/`
-- 默认 `MCPMemoryBackend` 以 `--project_path <root>` 启动，记忆写到 `<root>/memory.db`
+- hot state → `<root>/.longrun/state.json`
+- the default `MCPMemoryBackend` → launched with `--project_path <root>`, so
+  memory lands in `<root>/memory.db`
 
-因此 `resume()` 读到的状态和记忆永远属于同一个项目。
+`resume()` can therefore never mix one project's state with another project's
+history.
 
-### 执行状态机
+### State machine
 
 ```mermaid
 stateDiagram-v2
@@ -61,288 +166,201 @@ stateDiagram-v2
     pending --> in_progress: start_task
     in_progress --> paused: checkpoint(interrupt)
     in_progress --> blocked: note_blocked
-    in_progress --> waiting_verification: checkpoint(status=waiting_verification)
+    in_progress --> waiting_verification: checkpoint(waiting_verification)
     in_progress --> completed: finish / checkpoint(complete)
-    in_progress --> failed: 失败
+    in_progress --> failed: error
     paused --> in_progress: resume
-    blocked --> in_progress: resume / 阻塞解除
-    waiting_verification --> in_progress: 退回修改
-    waiting_verification --> completed: 验收通过
+    blocked --> in_progress: resume
+    waiting_verification --> in_progress: send back
+    waiting_verification --> completed: accepted
     completed --> [*]
     failed --> [*]
 ```
 
-### 一次断点的时序
+Transitions are whitelisted. Anything else raises `TransitionError`; terminal
+states have no exits.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Agent
-    participant LRA as LongRunAgent
-    participant State as 状态机
-    participant Mem as MCP Memory
+## Core invariants
 
-    Agent->>LRA: start_task(desc)
-    LRA->>Mem: search_memory(关键词)
-    Mem-->>LRA: 本项目摘要列表
-    LRA->>Mem: read_raw_data(top 1)
-    LRA->>State: pending → in_progress（read_only）
-    LRA-->>Agent: 摘要 + 历史上下文
+1. **Memory before execution.** `start_task()` calls `search()` before it creates
+   state. No memory lookup, no task.
+2. **Memory before checkpoint output.** `checkpoint()` calls `save()` before it
+   returns text. If the save fails, it writes `.longrun/pending_checkpoint.json`
+   and raises `CheckpointWriteError` — it never prints a checkpoint that was not
+   persisted.
+3. **Write permission expires.** One approval covers one turn. Checkpointing,
+   resuming, recovering, and ending a turn all revoke it.
+4. **One project, one root.** State and memory share the same `root`; unfinished
+   tasks cannot be overwritten by a new `start_task`.
 
-    Agent->>LRA: enable_writes("方案已确认")
-    LRA->>State: read_only → writable
-
-    Agent->>LRA: checkpoint(reason, next_step, decisions)
-    LRA->>LRA: 渲染断点 + <!-- longrun-state -->
-    LRA->>Mem: save_memory(type=session)
-    alt 写入成功
-        Mem-->>LRA: S_xxxx
-        LRA->>State: in_progress → paused
-        LRA-->>Agent: 断点文本
-    else 写入失败
-        LRA->>LRA: 写 .longrun/pending_checkpoint.json
-        LRA-->>Agent: CheckpointWriteError（不输出断点）
-    end
-```
-
-## 快速开始
-
-把两个仓库放在同级目录（默认会在这里找记忆路由器）：
-
-```text
-D:/
-├── agent-memory-router-v2/
-└── Agent-LongRun-Framework-v2/
-```
-
-```bash
-git clone https://github.com/lss486558354-ship-it/agent-memory-router-v2.git
-git clone https://github.com/lss486558354-ship-it/Agent-LongRun-Framework-v2.git
-
-cd Agent-LongRun-Framework-v2
-python -m pip install -e ".[dev]"
-python -m pip install -e ../agent-memory-router-v2
-
-python -m pytest tests/ -q                    # 42 passed
-python examples/01_interrupted_task.py        # 本地后端
-python examples/01_interrupted_task.py --mcp  # 真实 MCP stdio
-```
-
-路由器不在同级目录时，用环境变量指定：
-
-```bash
-export AGENT_MEMORY_ROUTER_PATH=D:/agent-memory-router-v2
-```
-
-> `MEMORY_ROUTER_HOME` 仍作为旧版兼容入口保留，但 v2 推荐直接用
-> `LongRunAgent(root=...)` / `MCPMemoryBackend(project_path=...)`。
-
-### 在真实项目里启用
-
-```bash
-cd D:/my-project
-agent-projects init
-```
-
-这会在项目根目录生成 `.mcp.json`、`.cursorrules`、skill、`.gitignore`，
-并创建 `memory.db` / `raw_data/`。之后：
-
-```python
-agent = LongRunAgent(root="D:/my-project")
-```
-
-Python API 不依赖 `.mcp.json`，它会自己把 `--project_path` 传给 MCP 子进程；
-`.mcp.json` 是给 Claude Code / Cursor 里的 Agent 用的。两者指向同一个项目。
-
-## 用法
+## Usage
 
 ```python
 from workflow_manager import LongRunAgent
 
-agent = LongRunAgent(root="D:/my-project")   # 状态 + 默认记忆库都绑定该项目
+agent = LongRunAgent(root="D:/my-project")   # state + default memory bound here
 
-# 1. 启动：内部先 search_memory，再建状态；默认只读
-started = agent.start_task("实现报价平台适配器")
-print(started.summary)
-print(started.memories)                 # 本项目命中的历史摘要
-print(started.context)                  # 自动加载的原文（默认 1 条）
+# 1. Start: search_memory first, then create read-only state
+started = agent.start_task("implement the quoting adapter")
+print(started.memories)   # project-scoped summaries
+print(started.context)    # on-demand raw text (top 1 by default)
 
-# 2. 调研完成，显式解锁写入
-agent.enable_writes("已读完历史方案，进入实施")
-agent.require_writable("修改 adapters/xometry.py")
+# 2. Research done: unlock writes for this turn
+agent.enable_writes("read the old plan, moving to implementation")
+agent.require_writable("edit adapters/xometry.py")
 
-# 3. 中断：先写记忆，成功后才返回断点
+# 3. Interrupt: memory first, checkpoint second
 checkpoint = agent.checkpoint(
-    reason="token 预警",
-    summary="完成 Xometry 只读探测器",
-    next_step="接入 Protolabs",
-    decisions=["先只读探测，不做登录自动化"],
+    reason="token budget warning",
+    summary="Xometry read-only prober is done",
+    next_step="wire up Protolabs",
+    decisions=["read-only probing first, no login automation"],
 )
-print(checkpoint.text)                  # 最后一行是机器可读状态标记
+print(checkpoint.text)    # last line: <!-- longrun-state: {...} -->
 
-# 4. 新进程恢复（同一个项目根）
+# 4. New process, same project root
 agent = LongRunAgent(root="D:/my-project")
 bundle = agent.resume()
 print(bundle.state.status, bundle.state.next_step)
 
-# 5. 阶段归档 / 完成
-agent.complete_phase("阶段2：接入 Xometry", "只读探测跑通",
-                     decisions=["标记为需登录"], next_step="阶段3")
-agent.finish("全部平台接入完成")
+# 5. v3: resume is read-only again — re-authorize before writing
+agent.enable_writes("confirmed after resume")
+agent.require_writable("continue editing adapters/xometry.py")
+
+# 6. Phase archive / finish
+agent.complete_phase("phase 2: Xometry", "read-only probe passed",
+                     decisions=["login required"], next_step="phase 3")
+agent.finish("all adapters wired and verified")
 ```
 
-换机器、本地状态丢失时：
+On a new machine, with local state gone (also read-only — re-authorize writes):
 
 ```python
 agent = LongRunAgent(root="/new/machine")
 bundle = agent.recover_from_memory("T_20261024_155703_2f9c")
+agent.enable_writes("confirm the recovered next step")
 ```
 
-## 记忆后端
+## Memory backends
 
-| 后端 | 用途 | 说明 |
-|------|------|------|
-| `MCPMemoryBackend`（默认） | 生产 / 跨进程 | 每次调用拉起 MCP stdio 子进程，带 `--project_path` |
-| `LocalMemoryBackend` | 示例 / 同机 | 进程内 import `memory_core.configure(project_path)` |
-| `InMemoryBackend` | 测试 | 带调用记录，可断言顺序 |
+| Backend | Use | Notes |
+|---|---|---|
+| `MCPMemoryBackend` (default) | production / cross-process | spawns an MCP stdio child per call with `--project_path` |
+| `LocalMemoryBackend` | examples / same machine | in-process `memory_core.configure(project_path)` |
+| `InMemoryBackend` | tests | records calls so ordering can be asserted |
 
-统一协议：`search / read_raw / save / link`。
+Protocol: `search / read_raw / save / link`.
 
 ```python
-# 显式指定后端时，同样要传项目根
 MCPMemoryBackend(project_path="D:/my-project")
 LocalMemoryBackend(project_path="D:/my-project")
 
-# v0.1 的 home= 仍然可用，等价于 project_path=
+# v0.1 spelling still works
 MCPMemoryBackend(home="D:/my-project")
 ```
 
-`LocalMemoryBackend` 的项目根是模块级全局配置：同一 Python 进程内不要来回切换项目，
-需要并行处理多个项目时用多个 `MCPMemoryBackend`（各自子进程）。
+`LocalMemoryBackend` binds the project root as module-level global state: do not
+switch projects inside one process. Use one `MCPMemoryBackend` per project.
 
-## 接入 Cursor / Claude Code
-
-推荐直接用路由器的一键脚手架：
+## Set up a real project
 
 ```bash
 cd D:/my-project
 agent-projects init
 ```
 
-它生成的 `.mcp.json` 等价于：
+This writes `.mcp.json`, `.cursorrules`, a skill, and `.gitignore`, and creates
+`memory.db` / `raw_data/`. Then:
 
-```json
-{
-  "mcpServers": {
-    "agent-memory-router": {
-      "command": "C:/Python313/python.exe",
-      "args": [
-        "D:/agent-memory-router-v2/mcp_server.py",
-        "--project_path",
-        "D:/my-project"
-      ],
-      "env": {
-        "PYTHONIOENCODING": "utf-8",
-        "PYTHONUTF8": "1"
-      }
-    }
-  }
-}
+```python
+agent = LongRunAgent(root="D:/my-project")
 ```
 
-然后把 `.cursorrules` / `CLAUDE.md` 放进项目根目录。规则细则在 `rules/`，
-两个标准作业流程在 `skills/auto-dev-workflow/SKILL.md`：
+The Python API does not depend on `.mcp.json`; it passes `--project_path` to the
+MCP child itself. The JSON file is for agents running inside Claude Code or
+Cursor. Both point at the same project.
 
-- `interrupted-task-recovery`：读记忆 → 校验状态机 → 按需读原文 → 恢复执行
-- `phase-completion-archive`：阶段完成 → 结构化写记忆 → 汇报
+## Design decisions
 
-## 设计要点
+**Why bind state and memory to the same root?**
+A checkpoint restores *this project's* progress. If state lives in A and memory
+in B, `resume()` will take A's `next_step` and look it up in B's history, with no
+way to tell which side is right.
 
-**为什么状态和记忆都绑定项目根？**
-断点要恢复的是「这个项目的进度」。如果状态在 A、记忆在 B，`resume()` 会拿 A 的
-`next_step` 去查 B 的历史，冲突时无法判断谁对。让两者共用 `root` 是最短的约束。
+**Why save memory before printing a checkpoint?**
+The printed checkpoint is a receipt. Reverse the order and a killed process
+leaves the chat log as the only copy — the least durable store in the system.
 
-**为什么断点必须先写记忆再输出？**
-断点输出是「已保存」的回执。反过来做，一旦进程被杀，聊天记录里的断点就是唯一副本，
-而聊天记录恰恰是最不可靠的存储。
+**Why a JSON marker inside the checkpoint?**
+Recovering from prose forces the model to guess status. The marker lets
+`recover_from_memory()` rebuild `TaskStatus / AccessMode / completed_steps`
+exactly.
 
-**为什么断点里要塞一行 JSON 标记？**
-自然语言断点恢复时要靠模型「猜」状态。机器标记让 `recover_from_memory()`
-可以精确重建 `TaskStatus / AccessMode / completed_steps`，不猜。
+**Why both local state and memory?**
+`.longrun/state.json` is the hot path: fast and atomic. Memory is the cold
+backup: cross-machine, cross-session. On conflict, the checkpoint in memory wins
+because it passed through a user-visible output path.
 
-**为什么本地状态和记忆都要写？**
-本地 `.longrun/state.json` 是热路径，快且原子；记忆是冷备份，跨机器、跨会话。
-两者冲突时以记忆中的断点为准，因为它经过用户可见的输出流程。
+**Why read-only by default?**
+The most common damage during research is editing before the design is settled.
+The gate turns "I approve the plan" into an explicit, audited action.
 
-**为什么默认只读？**
-调研阶段最常见的破坏是「还没想清楚就改」。门禁把「确认方案」变成一个必须显式执行的动作，
-同时把解锁原因写进 history，便于事后审计。
+**Why expire write permission every turn?**
+The failure mode is not the first approval — it is every turn after it. A user
+approves one edit; the agent keeps writing for the rest of the session. A lease
+turns approval into a bounded, auditable event with defined revocation points.
 
-**为什么状态文件损坏要报错？**
-静默当成「没有任务」，下一次 `start_task` 就会覆盖真实进度。宁可停下。
+**Why fail on a corrupted state file?**
+Treating it as "no task" lets the next `start_task` overwrite real progress.
+Stopping is cheaper.
 
-## 与两个上游项目的关系
+## How this differs
 
-| `engineering-workflow` | 本框架 |
-|------------------------|--------|
-| `pending / in_progress / waiting_verification / completed / blocked` | 扩展为 7 态，补 `paused` / `failed`，显式白名单流转 |
-| `[务必完成 · 断点]` 文本格式 | `[LongRun Checkpoint]` + 机器可读标记 |
-| token 耗尽自动续接 | `checkpoint(kind="interrupt")` + `resume()` |
-| 「动手前询问」 | 读写门禁 `read_only / writable` |
-| `project-profile.json` + `status.py` | `<项目根>/.longrun/state.json` + `StateStore` |
-| CHANGELOG 同步 | 记忆归档（session / decision） |
+| Project | What it gives you | What this adds |
+|---|---|---|
+| LangGraph | Graph orchestration, checkpointer | A task-state contract and per-turn write gate enforced outside the graph |
+| Temporal | Durable workflow execution | A local, file-based contract an LLM can be held to; no cluster |
+| Mem0 / vector stores | Semantic long-term memory | Project-scoped SQLite + raw text, with the *write ordering* as the invariant |
+| Claude Code hooks | Host-level tool interception | Backend-agnostic Python API + MCP, usable from any host |
 
-| `agent-memory-router-v2` | 本框架 |
-|-------------------------|--------|
-| 项目级 `memory.db` + `raw_data/` | 用 `--project_path` / `project_path=` 绑定同一个根 |
-| `search_memory` | `start_task` / `recover_from_memory` |
-| `read_raw_data` | `hydrate` / `resume` 按需加载 |
-| `save_memory` | `checkpoint` / `complete_phase` / `finish` / `save_decision` |
-| `link_memory` | 决策与断点的 `related_to` 关系 |
-| SQLite 索引 + `raw_data/` 冷热分离 | 原样复用，不重复实现 |
+This is deliberately small: state machine, memory client, and glue. It is meant
+to be embedded, not to own your runtime.
 
-上游仓库不动，本框架通过协议层复用它们。
+## Known limitations
 
-## 目录
+- `begin_turn()` must be called by the host on each new user message; the
+  framework cannot detect message boundaries.
+- `resume()` / `recover_from_memory()` already start a new turn — do not call
+  `begin_turn()` again for the same message.
+- Every MCP call spawns a child process; high-frequency retrieval needs a
+  persistent connection or the local backend.
+- `LocalMemoryBackend` uses a process-global project root.
+- Keyword extraction is heuristic; there are no embeddings.
+- The state file has no lock; concurrent writers on one `.longrun/` are unsupported.
+- The API is synchronous; wrap it in a thread pool for async hosts.
+- Windows consoles need `PYTHONIOENCODING=utf-8`; examples reconfigure stdout.
 
-```text
-Agent-LongRun-Framework-v2/
-├── state_machine.py        # 7 态状态机、读写门禁、原子状态存储
-├── memory_client.py        # 三种记忆后端（MCP / Local / InMemory），绑定项目根
-├── workflow_manager.py     # LongRunAgent：start / checkpoint / resume / finish
-├── tests/                  # 42 个行为测试
-├── examples/               # 中断恢复、阶段归档两个可运行示例
-├── rules/                  # 四份可复用规则
-├── skills/auto-dev-workflow/SKILL.md
-├── .cursorrules
-├── CLAUDE.md
-└── README.md
-```
-
-## 测试
+## Tests
 
 ```bash
 python -m pytest tests/ -q
 ```
 
-覆盖的关键约束：
+The suite covers, among others:
 
-- 非法状态流转必须失败，终态无出口
-- `start_task` 第一次后端调用必须是 `search`
-- `checkpoint` 第一次后端调用必须是 `save`，失败则不返回断点
-- 只读模式拦截写操作，`enable_writes` 后放行
-- 本地状态丢失后，能从断点机器标记重建任务
-- 默认后端收到的 `project_path` 与 `root` 一致
-- MCP 子进程参数必须包含 `--project_path <项目根>`
-
-## 已知限制
-
-- 每次 MCP 调用都会拉起子进程，高频检索场景需要长连接或本地后端
-- `LocalMemoryBackend` 的项目根是模块级全局配置，同一进程不能并行切项目
-- 关键词提取是启发式的，没有语义向量
-- 状态文件没有加锁，同一 `.longrun/` 不支持并发写
-- 目前是同步 API；异步场景需要线程池包装
-- Windows 控制台需要 `PYTHONIOENCODING=utf-8`，示例已内置重配置
+- illegal transitions fail, terminal states have no exits
+- `start_task`'s first backend call is `search`
+- `checkpoint`'s first backend call is `save`; failure returns no checkpoint
+- read-only mode blocks writes; `enable_writes` allows them
+- the lease expires on `begin_turn` / `end_turn` / `checkpoint` / `resume` /
+  `recover_from_memory`
+- a stale lease is rejected even when `access_mode` is still `writable`
+- a legacy v2 `writable` state is downgraded on load
+- `recover_from_memory()` rebuilds state from the machine marker
+- the default backend receives the same `project_path` as `root`
+- the MCP child receives `--project_path <root>`
+- the router resolves from an installed module or a sibling directory
+- `agent-longrun demo` exits 0
 
 ## License
 

@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import sys
 import tempfile
 from pathlib import Path
@@ -31,10 +32,8 @@ def enable_utf8_console() -> None:
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure:
-            try:
+            with contextlib.suppress(ValueError, OSError):
                 reconfigure(encoding="utf-8", errors="replace")
-            except (ValueError, OSError):
-                pass
 
 
 def main() -> int:
@@ -59,6 +58,11 @@ def main() -> int:
     )
     print(f"  记忆：{first.memory_id}  {first.text.splitlines()[0]}")
     print(f"  已完成步骤：{first.state.completed_steps}")
+    print(
+        f"  阶段结束后门禁：{first.state.access_mode.value}"
+        "（下一轮需重新 enable_writes）"
+    )
+    agent.enable_writes("阶段2开始，重新授权")
 
     print("\n=== 单独沉淀决策 ===")
     decision = agent.save_decision(
@@ -84,6 +88,7 @@ def main() -> int:
 
     print(bundle.summary)
     print(f"  重建出的阶段：{bundle.state.phase}")
+    print(f"  恢复后门禁：{bundle.state.access_mode.value}（新轮次，需重新授权）")
     print(f"  已完成步骤：{bundle.state.completed_steps}")
     print(f"  关键决策：{bundle.state.decisions}")
     print(f"  关联记忆：{[r['id'] for r in bundle.related]}")

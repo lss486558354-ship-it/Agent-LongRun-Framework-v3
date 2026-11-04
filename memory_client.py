@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import importlib.util
 import json
 import os
 import sys
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -67,21 +69,57 @@ def _parse_relates_to(raw: str) -> list[tuple[str, str]]:
     return [(target, relation)] if target and relation else []
 
 
-def _default_router_path() -> Path:
-    """默认找同级目录下的 agent-memory-router-v2，回退到 v0.1。
+def _looks_like_router(path: Path) -> bool:
+    """同时有 mcp_server.py 和 memory_core.py 才算路由器目录。"""
+    return (path / "mcp_server.py").is_file() and (path / "memory_core.py").is_file()
 
-    允许用 AGENT_MEMORY_ROUTER_PATH 覆盖 —— 换机器 / 换目录时不必改代码。
+
+def _installed_router_path() -> Path | None:
+    """从已安装的 Python 模块反查路由器目录。
+
+    只靠 `__file__` 找同级目录在 editable 安装下可用，但 pip 装进
+    site-packages 后父目录里没有 agent-memory-router-v2。这里优先问
+    import 系统：两个模块由同一个包提供，找到任意一个即可定位目录。
+    """
+    for module_name in ("mcp_server", "memory_core"):
+        try:
+            spec = importlib.util.find_spec(module_name)
+        except (ImportError, ValueError):
+            continue
+        if spec is None or not spec.origin:
+            continue
+        candidate = Path(spec.origin).resolve().parent
+        if _looks_like_router(candidate):
+            return candidate
+    return None
+
+
+def _default_router_path() -> Path:
+    """定位 agent-memory-router-v2。
+
+    优先级：
+    1. `AGENT_MEMORY_ROUTER_PATH` 环境变量（显式覆盖）
+    2. 已安装的 `mcp_server` / `memory_core` 模块（pip 安装场景）
+    3. 本文件同级或上一级的 `agent-memory-router-v2`（editable / 仓库并列）
+    4. 当前工作目录下的同名目录（从任意目录运行脚本时）
     """
     env = os.environ.get("AGENT_MEMORY_ROUTER_PATH")
     if env:
         return Path(env).expanduser().resolve()
 
-    base = Path(__file__).resolve().parent.parent
-    for name in ("agent-memory-router-v2", "agent-memory-router"):
-        candidate = base / name
-        if (candidate / "mcp_server.py").exists():
-            return candidate
-    return base / "agent-memory-router-v2"
+    installed = _installed_router_path()
+    if installed is not None:
+        return installed
+
+    here = Path(__file__).resolve()
+    for base in (here.parent, here.parent.parent, Path.cwd()):
+        for name in ("agent-memory-router-v2", "agent-memory-router"):
+            candidate = base / name
+            if _looks_like_router(candidate):
+                return candidate
+
+    # 保留旧返回值，让 MCPMemoryBackend 的报错信息仍然指向一个可操作路径。
+    return here.parent.parent / "agent-memory-router-v2"
 
 
 def _resolve_project_path(
@@ -424,26 +462,29 @@ class MCPMemoryBackend:
         )
 
         debug = bool(os.environ.get("LONGRUN_MCP_DEBUG"))
-        errlog = sys.stderr if debug else open(os.devnull, "w", encoding="utf-8")
-        try:
-            async with stdio_client(params, errlog=errlog) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    result = await session.call_tool(
-                        tool,
-                        arguments,
-                        read_timeout_seconds=self.timeout_seconds,
+        with ExitStack() as stack:
+            errlog = (
+                sys.stderr
+                if debug
+                else stack.enter_context(open(os.devnull, "w", encoding="utf-8"))
+            )
+            async with (
+                stdio_client(params, errlog=errlog) as (read, write),
+                ClientSession(read, write) as session,
+            ):
+                await session.initialize()
+                result = await session.call_tool(
+                    tool,
+                    arguments,
+                    read_timeout_seconds=self.timeout_seconds,
+                )
+                text = _extract_text(result)
+                payload = json.loads(text)
+                if not payload.get("ok", False):
+                    raise MemoryBackendError(
+                        payload.get("error") or f"MCP 工具 {tool} 返回失败"
                     )
-                    text = _extract_text(result)
-                    payload = json.loads(text)
-                    if not payload.get("ok", False):
-                        raise MemoryBackendError(
-                            payload.get("error") or f"MCP 工具 {tool} 返回失败"
-                        )
-                    return payload
-        finally:
-            if not debug:
-                errlog.close()
+                return payload
 
     # -- 契约实现 -----------------------------------------------------------
 

@@ -1,6 +1,6 @@
 # PROJECT_INDEX
 
-> 最后更新：2026-10-25（v0.2 项目自治）
+> 最后更新：2026-11-04（v0.3 单轮写租约）
 > 维护规则：每次代码修改后追加「修改历史」，并刷新此处。
 
 ## 1. 项目基本信息
@@ -8,27 +8,29 @@
 | 项 | 内容 |
 |----|------|
 | 名称 | Agent-LongRun-Framework |
-| 版本 | 0.2.0 |
-| 定位 | 把 Agent 执行状态机与项目级 MCP 记忆路由耦合的长任务工作流 |
+| 版本 | 0.3.0 |
+| 定位 | 把 Agent 执行状态机与项目级 MCP 记忆路由耦合的长任务工作流；写权限为单轮租约 |
 | 语言 | Python 3.10+（开发环境 3.12.0） |
 | 依赖 | `mcp>=2.0,<3.0`；开发依赖 pytest、ruff |
-| 入口 | `workflow_manager.LongRunAgent` |
+| 入口 | `workflow_manager.LongRunAgent`；CLI `agent-longrun demo` |
 | 上游 | `engineering-workflow`（状态语义/断点格式）、`agent-memory-router-v2`（项目级 MCP 记忆） |
-| 远端 | https://github.com/lss486558354-ship-it/Agent-LongRun-Framework-v2 |
+| 远端 | https://github.com/lss486558354-ship-it/Agent-LongRun-Framework-v3 |
 | License | MIT |
 | 项目数据 | `<项目根>/.longrun/state.json`、`<项目根>/memory.db`、`<项目根>/raw_data/` |
 
 ## 2. 目录结构
 
 ```text
-Agent-LongRun-Framework-v2/
+Agent-LongRun-Framework-v3/
 ├── state_machine.py        # TaskStatus(7)、AccessMode、TRANSITIONS、TaskState、StateStore
 ├── memory_client.py        # MemoryBackend 协议 + MCP/Local/InMemory 三实现 + 项目根解析
-├── workflow_manager.py     # LongRunAgent 门面与断点/恢复逻辑
+├── workflow_manager.py     # LongRunAgent 门面、单轮写租约、断点/恢复逻辑
+├── cli.py                  # console script: agent-longrun demo
 ├── tests/
 │   ├── conftest.py         # 把仓库根加入 sys.path
 │   ├── test_state_machine.py
-│   └── test_workflow_manager.py
+│   ├── test_workflow_manager.py
+│   └── test_cli.py
 ├── examples/
 │   ├── 01_interrupted_task.py
 │   ├── 02_phase_archive.py
@@ -39,8 +41,11 @@ Agent-LongRun-Framework-v2/
 │   ├── 02-checkpoint-archive.md
 │   └── 03-execution-boundary.md
 ├── skills/auto-dev-workflow/SKILL.md
+├── .github/workflows/tests.yml
 ├── .cursorrules / CLAUDE.md
-├── README.md
+├── README.md               # English
+├── README.zh-CN.md         # 简体中文
+├── CHANGELOG.md
 ├── PROJECT_INDEX.md
 ├── pyproject.toml
 ├── requirements.txt / requirements-dev.txt
@@ -55,7 +60,8 @@ Agent-LongRun-Framework-v2/
 - `TaskStatus`：`pending / in_progress / paused / blocked / waiting_verification / completed / failed`
 - `AccessMode`：`read_only` / `writable`
 - `TRANSITIONS`：白名单流转；`completed`、`failed` 无出口
-- `TaskState`：任务上下文（描述、阶段、已完成步骤、决策、断点 id、history）
+- `TaskState`：任务上下文（描述、阶段、已完成步骤、决策、断点 id、history、
+  `turn_index`、`write_lease_turn`）
 - `StateStore(root)`：`<root>/.longrun/state.json` 原子读写（tmp → replace），损坏抛 `StateCorruptError`
 - `transition()` 校验流转并记录 history，最多保留 20 条
 
@@ -63,7 +69,9 @@ Agent-LongRun-Framework-v2/
 
 - `MemoryBackend` Protocol：`search / read_raw / save / link`
 - `_resolve_project_path()`：`project_path` > `home`（v0.1 别名）> `MEMORY_ROUTER_HOME` > cwd
-- `_default_router_path()`：`AGENT_MEMORY_ROUTER_PATH` > 同级 `agent-memory-router-v2` > v0.1
+- `_default_router_path()`：`AGENT_MEMORY_ROUTER_PATH` > 已安装的
+  `mcp_server` / `memory_core` 模块（`importlib.util.find_spec`）>
+  本文件同级/上一级 > cwd > v0.1 回退路径
 - `MCPMemoryBackend(project_path=...)`：stdio 拉起 `mcp_server.py`，参数带
   `--project_path <项目根>`，cwd 设为项目根；强制 UTF-8；`ok=false` 抛 `MemoryBackendError`
 - `LocalMemoryBackend(project_path=...)`：import `memory_core` 后调用
@@ -77,16 +85,23 @@ Agent-LongRun-Framework-v2/
   - `StateStore(project_root)`
   - 默认 `MCPMemoryBackend(project_path=project_root)`
   - 保证热状态与冷记忆属于同一个项目
-- `start_task()`：拒绝覆盖未完成任务 → 检索 → hydrate → `PENDING→IN_PROGRESS` → 落盘
-- `checkpoint()`：副本上改状态 → 渲染（含 `<!-- longrun-state: {...} -->`）→
-  `save_memory` → 成功后更新状态与 `checkpoint_id` → 返回
+- `start_task()`：拒绝覆盖未完成任务 → 检索 → hydrate → `PENDING→IN_PROGRESS`
+  → `turn_index=1` → 落盘
+- `checkpoint()`：收回写租约 → 副本上改状态 → 渲染（含
+  `<!-- longrun-state: {...} -->`）→ `save_memory` → 成功后更新状态与
+  `checkpoint_id` → 返回
 - 失败：写 `.longrun/pending_checkpoint.json`，抛 `CheckpointWriteError`，不返回断点
 - `complete_phase()`：状态保持 `in_progress`，阶段写入 `completed_steps`
 - `finish()`：归档后进 `completed`
 - `note_blocked()`：`blocked`
-- `resume()`：读本地状态 → 修到 `in_progress` → 读断点原文 → 搜索关联
+- `resume()`：读本地状态 → `_start_new_turn`（收回租约、`turn_index+1`）→
+  修到 `in_progress` → 读断点原文 → 搜索关联
 - `recover_from_memory()`：搜索 session → 读原文 → 正则解析机器标记 → 重建状态
-- 门禁：`enable_writes / disable_writes / require_writable`
+  → `_start_new_turn`（强制 `read_only`）
+- 门禁：`enable_writes / disable_writes / require_writable`；
+  `begin_turn / end_turn` 管理轮次边界
+- 单轮写租约：`enable_writes()` 设 `write_lease_turn=turn_index`；
+  `require_writable()` 同时校验模式与轮次，过期即拒绝
 - `save_decision()`：写 `decision`，与断点建 `related_to`
 - `extract_keywords()`：拉丁词 + 中文二字滑窗，过滤停用词与全虚词片段
 
@@ -99,12 +114,14 @@ LongRunAgent(root=项目根)
       → Memory.search（只查 <项目根>/memory.db）
       → Memory.read_raw（top 1）
       → StateStore.save（<项目根>/.longrun/state.json）
-  → 执行（read_only → enable_writes → writable）
+  → 执行（read_only → enable_writes → writable，仅当前 turn_index）
   → checkpoint
+      → 收回写租约（writable → read_only）
       → Memory.save（session，正文含机器标记）
-      → StateStore.save（status / checkpoint_id）
+      → StateStore.save（status / checkpoint_id / turn_index）
       → 返回断点
-  → resume / recover_from_memory（必须使用同一个 root）
+  → 新用户消息 begin_turn（turn_index+1，收回租约）
+  → resume / recover_from_memory（必须使用同一个 root；强制 read_only）
 ```
 
 MCP 子进程启动参数：
@@ -158,6 +175,20 @@ env = PYTHONIOENCODING=utf-8, PYTHONUTF8=1
 - 新增 4 个项目绑定测试，测试总数 42
 - 更新 README / CLAUDE.md / `.cursorrules` / rules / skill / examples / 本索引
 
+### 2026-11-04 · v0.3 单轮写租约
+
+- `TaskState` 新增 `turn_index` / `write_lease_turn`，旧状态自动兼容
+- `enable_writes()` 改为只授权当前轮；`begin_turn()` / `end_turn()` /
+  `checkpoint()` / `resume()` / `recover_from_memory()` 均收回租约
+- `require_writable()` 同时校验模式与租约轮次；过期租约抛 `WriteGateViolation`
+- 旧 v0.2 `writable` 状态在新实例加载时强制降为 `read_only`
+- `checkpoint()` 在渲染机器标记前收回租约，标记恒为 `read_only`
+- 修复 pip 安装后 router 定位：`importlib.util.find_spec` 查找已安装模块
+- 新增 `agent-longrun demo`（`cli.py`）与 `tests/test_cli.py`
+- 新增英文 `README.md`，中文版移至 `README.zh-CN.md`
+- 新增 `CHANGELOG.md` 与 GitHub Actions（Python 3.10–3.12）
+- 测试总数 52；示例与 demo 全部跑通
+
 ## 8. 技术债务
 
 | 级别 | 项 | 说明 |
@@ -168,14 +199,15 @@ env = PYTHONIOENCODING=utf-8, PYTHONUTF8=1
 | 中 | `LocalMemoryBackend` 项目根是模块全局 | 同进程不能并行切项目；生产走多个 MCP 子进程 |
 | 低 | 同步 API | 异步场景需线程池包装 |
 | 低 | 状态 schema 无版本号 | 未来字段变更需要迁移策略 |
-| 低 | 无 CI | 目前仅本地 pytest |
 | 低 | `mcp` 版本上限 `<3.0` | 升级需回归 stdio 调用 |
-| 低 | 默认路由器路径依赖同级目录 | 换目录需设 `AGENT_MEMORY_ROUTER_PATH` 或传参 |
+| 低 | 宿主需调用 `begin_turn()` | 框架看不到用户消息边界；漏调会让租约跨轮存活 |
+| 低 | `resume()` 自带 `begin_turn` | 宿主重复调用会多推进一轮（无害但审计不准确） |
 
 ## 9. 验证命令
 
 ```bash
 python -m pytest tests/ -q
+python -m cli demo
 python examples/01_interrupted_task.py
 python examples/01_interrupted_task.py --mcp
 python examples/02_phase_archive.py

@@ -63,7 +63,8 @@ python examples/02_phase_archive.py --mcp
 
 - 断点文本最后一行是 `<!-- longrun-state: {...} -->`
 - 每次断点都有 `S_xxxx` 形式的 memory_id
-- `resume()` 后状态从 `paused` 变回 `in_progress`，门禁保持
+- `resume()` 后状态从 `paused` 变回 `in_progress`，门禁回到 `read_only`
+  （v3 单轮写租约：换轮/断点/恢复后必须重新 `enable_writes`）
 - 恢复出来的 `next_step` / `decisions` 与断点时一致
 - 临时目录下出现 `memory.db` / `raw_data/`，而不是路由器仓库的 `data/`
 

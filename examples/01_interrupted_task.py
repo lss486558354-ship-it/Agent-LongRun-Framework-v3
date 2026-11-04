@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import sys
 import tempfile
 from pathlib import Path
@@ -31,10 +32,8 @@ def enable_utf8_console() -> None:
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure:
-            try:
+            with contextlib.suppress(ValueError, OSError):
                 reconfigure(encoding="utf-8", errors="replace")
-            except (ValueError, OSError):
-                pass
 
 
 def build_memory(project_root: Path):
@@ -98,6 +97,15 @@ def main() -> int:
     print(f"  断点记忆：{bundle.state.checkpoint_id}")
     if bundle.checkpoint:
         print(f"  断点原文前 60 字：{bundle.checkpoint['content'][:60]}…")
+
+    print("\n  说明：resume 开启新一轮，上一轮写权限已收回")
+    try:
+        resumed_agent.require_writable("恢复后直接写")
+    except Exception as exc:
+        print(f"  门禁生效：{type(exc).__name__}")
+    resumed_agent.enable_writes("恢复后确认继续")
+    resumed_agent.require_writable("继续修改适配器")
+    print("  已在当前轮次重新授权")
 
     print("\n=== 5. 完成 ===")
     done = resumed_agent.finish("两个平台适配器均已接入并通过只读验证")

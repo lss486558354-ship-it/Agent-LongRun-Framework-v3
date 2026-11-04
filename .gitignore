@@ -27,6 +27,7 @@ dist/
 
 # 备份与临时文件
 .backups/
+.agent-workflow-backups/
 BUG_DESCRIPTION.md
 *.tmp
 *.bak
@@ -39,9 +40,11 @@ BUG_DESCRIPTION.md
 credentials.enc
 ACCOUNTS.local.md
 
-# 编辑器 / 系统
+# 编辑器 / 系统 / 本地 Agent 配置
 .idea/
 .vscode/
+.claude/
+.mcp.json
 .DS_Store
 Thumbs.db
 desktop.ini

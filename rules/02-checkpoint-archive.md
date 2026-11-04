@@ -44,11 +44,14 @@
 断点原文最后一行必须是：
 
 ```html
-<!-- longrun-state: {"task_id":"T_...","status":"paused","access_mode":"writable",...} -->
+<!-- longrun-state: {"task_id":"T_...","status":"paused","access_mode":"read_only","turn_index":1,...} -->
 ```
 
 它是「换机器后只靠记忆重建状态」的唯一依据。
 禁止省略，禁止拆成多行，禁止在标记里塞正文。
+
+v3 起 `checkpoint()` 会先收回单轮写租约再渲染标记，所以这里正常就是
+`read_only`。恢复后要继续写，必须在新的轮次重新 `enable_writes(原因)`。
 
 ## 写入失败怎么办
 

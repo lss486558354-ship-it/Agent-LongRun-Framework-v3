@@ -3,7 +3,7 @@
 本项目的 Agent 必须同时受「状态机」和「记忆路由」约束。
 细则见 `rules/`，技能见 `skills/auto-dev-workflow/SKILL.md`。
 
-## 项目边界（v0.2）
+## 项目边界（v0.3）
 
 - 一个任务绑定一个项目根：`LongRunAgent(root=项目根)`
 - 状态在 `<项目根>/.longrun/`，记忆在 `<项目根>/memory.db` 与 `raw_data/`
@@ -33,12 +33,17 @@
 写入失败 → 不输出断点，落 `.longrun/pending_checkpoint.json`，明确告知用户。
 禁止「先口头断点，回头再补」。
 
-## 读写门禁
+## 读写门禁（单轮写租约）
 
 - 新任务默认 `read_only`：只能读、查、分析
-- 方案确认后调用 `enable_writes(原因)` 解锁；原因会记入 history
+- 方案确认后调用 `enable_writes(原因)` 解锁**当前轮**；原因会记入 history
 - 每次写操作前 `require_writable(动作)`
 - 回到调研/等待确认时 `disable_writes(原因)`
+- `begin_turn()` / `end_turn()` / `checkpoint()` / `resume()` /
+  `recover_from_memory()` 都会收回写权限
+- 一条批准只覆盖一轮；下一轮继续写必须重新 `enable_writes`
+- 宿主必须在每条新用户消息开始时调用 `begin_turn()`；
+  `resume()` 已自带一次，不要重复调用
 - 写操作包括：改文件、删除、`git commit/push`、装依赖、有副作用的外部请求
 
 ## 状态机
@@ -65,3 +70,4 @@ completed / failed 为终态
 - 把断点只留在聊天记录里
 - 在只读模式下修改任何文件
 - 用自然语言声称状态已切换，实际没有调用状态机
+- 把一次 `enable_writes()` 当成持久开关，跨轮次继续写
