@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import types
 
 import pytest
@@ -57,6 +58,12 @@ def start(agent: LongRunAgent, **kwargs):
     params = {"keywords": "报价,适配器"}
     params.update(kwargs)
     return agent.start_task("实现报价平台适配器", **params)
+
+
+def _start_task_worker(root: str) -> None:
+    """子进程启动一个任务，用于验证 start_task 的跨进程互斥。"""
+    agent = LongRunAgent(InMemoryBackend(), root=root)
+    agent.start_task("子进程任务", keywords="并发")
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +114,34 @@ def test_start_task_refuses_to_overwrite_active_task(agent) -> None:
         start(agent)
 
 
+def test_start_task_detects_active_task_started_by_another_agent(
+    tmp_path, memory
+) -> None:
+    """另一个 Agent 已经启动任务时，缓存里的「无任务」不能作为覆盖依据。"""
+    first = LongRunAgent(memory, root=tmp_path)
+    second = LongRunAgent(memory, root=tmp_path)
+
+    first.start_task("任务 A", keywords="任务A")
+
+    with pytest.raises(LongRunError, match="已有未完成任务"):
+        second.start_task("任务 B", keywords="任务B")
+
+
+def test_start_task_detects_active_task_started_by_another_process(
+    tmp_path, memory
+) -> None:
+    """父进程 Agent 先实例化，子进程随后启动任务；父进程必须重新读盘。"""
+    agent = LongRunAgent(memory, root=tmp_path)
+    ctx = multiprocessing.get_context("spawn")
+    process = ctx.Process(target=_start_task_worker, args=(str(tmp_path),))
+    process.start()
+    process.join(30)
+    assert process.exitcode == 0
+
+    with pytest.raises(LongRunError, match="已有未完成任务"):
+        agent.start_task("父进程任务", keywords="父进程")
+
+
 def test_start_task_defaults_to_read_only(agent) -> None:
     result = start(agent)
 
@@ -114,6 +149,18 @@ def test_start_task_defaults_to_read_only(agent) -> None:
     assert result.state.turn_index == 1
     assert result.state.write_lease_turn is None
     assert "enable_writes" in result.summary
+
+
+def test_start_task_rejects_writable_start(agent) -> None:
+    """启动即写必须被封死：旧调用方式硬报错，不静默降级。"""
+    with pytest.raises(LongRunError, match="只读"):
+        agent.start_task("直接改代码", access_mode=AccessMode.WRITABLE)
+
+
+def test_start_task_rejects_any_access_mode_argument(agent) -> None:
+    """access_mode 不再是公开参数；显式传只读也视为旧 API。"""
+    with pytest.raises(LongRunError, match="access_mode"):
+        agent.start_task("调研", access_mode=AccessMode.READ_ONLY)
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +280,57 @@ def test_enable_writes_unlocks(agent) -> None:
     assert "方案已确认" in agent.status()["history"][-1]["reason"]
 
 
+@pytest.mark.parametrize(
+    "status",
+    [
+        TaskStatus.PAUSED,
+        TaskStatus.BLOCKED,
+        TaskStatus.WAITING_VERIFICATION,
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+    ],
+)
+def test_enable_writes_rejected_outside_in_progress(agent, status) -> None:
+    start(agent)
+    state = agent._state
+    assert state is not None
+    state.transition(status, "测试非执行状态")
+    # 门禁会重新读盘，非执行状态必须真正落盘才能模拟跨进程修改。
+    agent.store.save(state, expected_revision=state.revision)
+
+    with pytest.raises(LongRunError, match="不允许|已结束"):
+        agent.enable_writes("试图解锁")
+
+
+def test_enable_writes_requires_non_empty_reason(agent) -> None:
+    start(agent)
+
+    with pytest.raises(LongRunError, match="原因"):
+        agent.enable_writes("")
+    with pytest.raises(LongRunError, match="原因"):
+        agent.enable_writes("   ")
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        TaskStatus.PAUSED,
+        TaskStatus.BLOCKED,
+        TaskStatus.WAITING_VERIFICATION,
+    ],
+)
+def test_require_writable_rejected_outside_in_progress(agent, status) -> None:
+    start(agent)
+    agent.enable_writes("先解锁")
+    state = agent._state
+    assert state is not None
+    state.transition(status, "测试非执行状态")
+    agent.store.save(state, expected_revision=state.revision)
+
+    with pytest.raises(WriteGateViolation, match="in_progress|只读|不允许"):
+        agent.require_writable("写文件")
+
+
 def test_disable_writes_relocks(agent) -> None:
     start(agent)
     agent.enable_writes("开始实施")
@@ -279,7 +377,11 @@ def test_stale_lease_is_rejected_even_if_mode_is_writable(agent) -> None:
     agent.enable_writes("方案确认")
 
     # 模拟外部把状态文件改成 writable、但轮次已经前进的异常情况。
-    agent._state.turn_index += 1  # type: ignore[union-attr]
+    # 必须落盘：门禁现在从磁盘读取最新状态，不能只改内存。
+    state = agent._state
+    assert state is not None
+    state.turn_index += 1
+    agent.store.save(state, expected_revision=state.revision)
 
     with pytest.raises(WriteGateViolation, match="已过期"):
         agent.require_writable("写文件")
@@ -304,11 +406,13 @@ def test_legacy_writable_state_is_revoked_on_load(tmp_path, memory) -> None:
     state = TaskState(
         task_id="T_OLD",
         description="v2 遗留任务",
-        access_mode=AccessMode.WRITABLE,
         turn_index=1,
-        write_lease_turn=1,
     )
     state.transition(TaskStatus.IN_PROGRESS)
+    # 直接构造 v2 遗留状态：新构造器会归一化非执行状态，
+    # 这里要验证的是 LongRunAgent 加载时的兼容收回。
+    state.access_mode = AccessMode.WRITABLE
+    state.write_lease_turn = 1
     store.save(state)
 
     agent = LongRunAgent(memory, root=tmp_path)

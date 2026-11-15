@@ -13,6 +13,17 @@
 两者必须指向同一个项目。`resume()` 跨项目读取会得到错误的 `next_step`，
 且大概率在错误的记忆库里找不到断点。
 
+## 状态文件并发
+
+同一个项目根可能被多个进程同时打开（多个终端、多个 MCP 子进程）。
+`state.json` 的读-改-写必须经过 `.longrun/state.lock` 跨进程锁：
+
+- 每次保存写唯一临时文件，再 `os.replace`；不共用固定 `.tmp`
+- `TaskState.revision` 每次成功保存递增；`save(expected_revision=...)`
+  不匹配时抛 `StateConflict`
+- 遇到 `StateConflict` 不要直接重试覆盖；先 `resume()` 对齐状态
+- 锁文件永不删除；删除会让并发进程各持不同 inode 的锁
+
 ## 状态机
 
 ```text
@@ -40,6 +51,11 @@ pending ──▶ in_progress ──▶ paused ──▶ in_progress
 - 已有未完成任务时，禁止 `start_task` 覆盖；先 `resume()` 或 `finish()`
 - 终态任务禁止再写断点
 - 状态文件损坏必须报错，不能静默当成「没有任务」
+- `start_task()` 永远以 `read_only` 启动；`access_mode` 不是公开参数，
+  旧调用会直接抛 `LongRunError`（不存在「启动即写」的合法路径）
+- `transition()` 进入任何新状态都会收回写租约；跨状态不继承写权限
+- `from_dict()` / `__post_init__()` 会把非 `in_progress` 状态的 writable
+  租约归一化为 `read_only`
 
 ## 读写门禁（单轮写租约）
 
@@ -50,19 +66,22 @@ pending ──▶ in_progress ──▶ paused ──▶ in_progress
 
 规则：
 
-1. 新任务一律从 `read_only` 开始
-2. 调研完成、方案确认后，调用 `enable_writes("原因")` 解锁**当前轮**
+1. 新任务一律从 `read_only` 开始；`start_task()` 不接受 `access_mode`
+2. 调研完成、方案确认后，调用 `enable_writes("原因")` 解锁**当前轮**；
+   只有 `in_progress` 状态可以解锁
 3. 每次写操作前调用 `require_writable("动作")`
 4. 回到调研/等待确认时，调用 `disable_writes("原因")` 重新上锁
-5. `enable_writes` 必须带原因，原因会写进 `history`，便于事后审计
+5. `enable_writes` 必须带非空原因，原因会写进 `history`，便于事后审计
 6. 门禁是基于「当前任务状态」的，不是基于「用户的某句话」的；
    用户说「动手吧」之后仍应先更新状态，再执行写操作
 7. `begin_turn()` / `end_turn()` / `checkpoint()` / `resume()` /
    `recover_from_memory()` 都会收回写权限；一条批准只覆盖一轮
 8. 宿主必须在每条新用户消息开始时调用 `begin_turn()`；
    `resume()` 已自带一次，不要重复调用
-9. `require_writable()` 同时校验 `access_mode` 与 `write_lease_turn`；
-   过期租约即使模式仍是 `writable` 也必须拒绝
+9. `require_writable()` 同时校验 `status is in_progress`、`access_mode`
+   与 `write_lease_turn`；过期租约即使模式仍是 `writable` 也必须拒绝
+10. `paused` / `blocked` / `waiting_verification` / 终态都不是可写状态；
+    `transition()` 会自动收回租约，恢复后必须重新 `enable_writes(原因)`
 
 ## 哪些算写操作
 

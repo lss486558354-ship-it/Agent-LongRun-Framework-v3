@@ -17,8 +17,10 @@
 
 1. **确认项目根**：`LongRunAgent(root=项目根)`，状态与记忆都绑定它
 2. **先检索**：调用 `search_memory`，或 `LongRunAgent.start_task()`（内部已强制先检索）
-3. **建状态**：任务进入 `in_progress`，读写门禁默认 `read_only`
-4. **再动手**：任何写操作前确认门禁已通过 `enable_writes(原因)` 解锁
+3. **建状态**：任务进入 `in_progress`，读写门禁默认 `read_only`；
+   `start_task()` 不接受 `access_mode`，不存在启动即写
+4. **再动手**：任何写操作前确认门禁已通过 `enable_writes(原因)` 解锁；
+   只有 `in_progress` 状态可以解锁
 
 项目根决定两处数据：
 
@@ -34,6 +36,7 @@
 - 没检索记忆就宣称「没有历史方案」
 - 没建状态就开始多阶段改造
 - 用聊天里的自然语言断点，代替 `save_memory` 落盘
+- 在 `start_task()` 里指定 `access_mode=writable`（会直接报错）
 
 ## 与其它规则的关系
 

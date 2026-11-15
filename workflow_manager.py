@@ -55,7 +55,9 @@ from memory_client import (  # noqa: F401 - 重新导出，调用方只需 impor
 from state_machine import (
     TERMINAL_STATUSES,
     AccessMode,
+    StateConflict,
     StateCorruptError,  # noqa: F401 - 方便调用方捕获
+    StateLockTimeout,  # noqa: F401 - 方便调用方捕获
     StateStore,
     TaskState,
     TaskStatus,
@@ -76,6 +78,8 @@ __all__ = [
     "MemoryBackendError",
     "NoActiveTask",
     "RecoveryBundle",
+    "StateConflict",
+    "StateLockTimeout",
     "TaskStart",
     "TaskState",
     "TaskStatus",
@@ -272,11 +276,18 @@ class LongRunAgent:
 
         # v2 的 writable 没有轮次租约。新实例视为新会话：
         # 旧的写权限一律作废，必须重新 enable_writes()。
+        # 锁内重新读盘，避免两个新进程同时启动时互相覆盖。
         if self._state and self._state.access_mode is AccessMode.WRITABLE:
-            self._state.access_mode = AccessMode.READ_ONLY
-            self._state.write_lease_turn = None
-            self._state.note("v3: legacy write permission revoked on load")
-            self.store.save(self._state)
+            with self.store.locked():
+                current = self.store.load()
+                if current is not None and current.access_mode is AccessMode.WRITABLE:
+                    self._revoke_write_lease(
+                        current, "v3: legacy write permission revoked on load"
+                    )
+                    self.store.save(current, expected_revision=current.revision)
+                    self._state = current
+                else:
+                    self._state = current
 
     # -- 任务生命周期 -------------------------------------------------------
 
@@ -285,25 +296,37 @@ class LongRunAgent:
         task_desc: str,
         *,
         keywords: str | Iterable[str] | None = None,
-        access_mode: AccessMode = AccessMode.READ_ONLY,
         hydrate_top: int | None = None,
         task_id: str | None = None,
+        **legacy_kwargs: Any,
     ) -> TaskStart:
         """开始长任务。**先检索记忆，再建状态。**
 
-        默认进入 READ_ONLY：调研阶段不应该改代码。
-        确认方案后调用 `enable_writes()`。
+        任务永远以 READ_ONLY 启动：调研阶段不应该改代码。
+        确认方案后调用 `enable_writes(原因)` 获取当前轮写租约。
+
+        v3 修复：`access_mode` 不再是公开参数。任何试图在启动时指定写模式的
+        旧调用都会直接报错，不存在「启动即写」的合法路径。
         """
+        if "access_mode" in legacy_kwargs:
+            raise LongRunError(
+                "start_task() 不再接受 access_mode：新任务只能以只读启动。"
+                "请先完成调研，再调用 enable_writes(原因) 获取当前轮写租约。"
+            )
+        if legacy_kwargs:
+            unexpected = ", ".join(sorted(legacy_kwargs))
+            raise TypeError(
+                f"start_task() got unexpected keyword argument(s): {unexpected}"
+            )
+
         task_desc = (task_desc or "").strip()
         if not task_desc:
             raise LongRunError("task_desc 不能为空。")
 
-        if self._state and self._state.status not in TERMINAL_STATUSES:
-            raise LongRunError(
-                f"已有未完成任务 {self._state.task_id}"
-                f"（{self._state.status.value}）。"
-                "请先 resume() 继续，或 finish() 结束，不要直接覆盖。"
-            )
+        # 先用磁盘上的权威状态做一次快速检查；检索完再在锁内复查一次。
+        # 不依赖 self._state 缓存：另一个进程可能刚结束或刚启动任务。
+        with self.store.locked():
+            self._ensure_no_active_task(self.store.load())
 
         # 铁律 1：任务开始先查记忆。
         terms = _normalize_keywords(keywords) or extract_keywords(task_desc)
@@ -313,16 +336,21 @@ class LongRunAgent:
         top_n = self.hydrate_top if hydrate_top is None else max(0, int(hydrate_top))
         context = self._hydrate(memories, top_n)
 
-        initial_access = AccessMode(access_mode)
         state = TaskState(
             task_id=task_id or self._new_task_id(),
             description=task_desc,
-            access_mode=initial_access,
+            access_mode=AccessMode.READ_ONLY,
             turn_index=1,
-            write_lease_turn=1 if initial_access is AccessMode.WRITABLE else None,
         )
         state.transition(TaskStatus.IN_PROGRESS, "start_task")
-        self.store.save(state)
+
+        # 检索可以慢，放在锁外；创建状态必须在锁内重新读盘。
+        # 否则两个进程各自看到「没有任务」，后写的那个会覆盖先写的进度。
+        with self.store.locked():
+            current = self.store.load()
+            self._ensure_no_active_task(current)
+            expected = current.revision if current is not None else 0
+            self.store.save(state, expected_revision=expected)
         self._state = state
 
         summary = self._start_summary(state, memories, context)
@@ -353,38 +381,47 @@ class LongRunAgent:
         if kind not in {"interrupt", "phase_complete", "blocked", "complete"}:
             raise CheckpointError(f"未知断点类型：{kind}")
 
-        state = self._require_state()
-        if state.status in TERMINAL_STATUSES:
-            raise CheckpointError(
-                f"任务 {state.task_id} 已处于终态 {state.status.value}，不能再写断点。"
+        # 锁内读盘 → 在副本上改 → 渲染；锁外写记忆；锁内按 revision 提交。
+        # 记忆写入可能是慢速 MCP 调用，不能一直持有跨进程锁。
+        with self.store.locked():
+            state = self.store.load()
+            if state is None:
+                raise NoActiveTask("当前没有活动任务，先调用 start_task()。")
+            if state.status in TERMINAL_STATUSES:
+                raise CheckpointError(
+                    f"任务 {state.task_id} 已处于终态 {state.status.value}，"
+                    "不能再写断点。"
+                )
+
+            # 在副本上改，记忆写失败时不污染磁盘上的真实状态。
+            working = TaskState.from_dict(state.to_dict())
+            base_revision = state.revision
+
+            if phase:
+                working.phase = phase
+            if next_step:
+                working.next_step = next_step
+            if decisions:
+                working.decisions.extend(str(d) for d in decisions)
+
+            if summary:
+                if kind == "phase_complete":
+                    working.completed_steps.append(f"{working.phase}: {summary}")
+                else:
+                    working.completed_steps.append(summary)
+
+            # v3：断点即一轮执行的结束。先收回写租约，再渲染状态标记；
+            # 这样从断点恢复出来的任务一定是 read_only，必须重新授权。
+            self._revoke_write_lease(working, f"checkpoint:{kind}")
+
+            target = self._target_status(kind, status)
+            if target is not None and target is not working.status:
+                working.transition(target, f"checkpoint:{kind}")
+
+            content = self._render_checkpoint(
+                working, kind=kind, reason=reason, summary=summary
             )
-
-        # 在副本上改，记忆写失败时不污染内存中的真实状态。
-        working = TaskState.from_dict(state.to_dict())
-
-        if phase:
-            working.phase = phase
-        if next_step:
-            working.next_step = next_step
-        if decisions:
-            working.decisions.extend(str(d) for d in decisions)
-
-        if summary:
-            if kind == "phase_complete":
-                working.completed_steps.append(f"{working.phase}: {summary}")
-            else:
-                working.completed_steps.append(summary)
-
-        # v3：断点即一轮执行的结束。先收回写租约，再渲染状态标记；
-        # 这样从断点恢复出来的任务一定是 read_only，必须重新授权。
-        self._revoke_write_lease(working, f"checkpoint:{kind}")
-
-        target = self._target_status(kind, status)
-        if target is not None and target is not working.status:
-            working.transition(target, f"checkpoint:{kind}")
-
-        content = self._render_checkpoint(working, kind=kind, reason=reason, summary=summary)
-        title = self._checkpoint_title(working, kind)
+            title = self._checkpoint_title(working, kind)
 
         # 铁律 2：save_memory 必须先于「输出断点」。
         try:
@@ -397,6 +434,7 @@ class LongRunAgent:
         except Exception as exc:  # noqa: BLE001 - 任何失败都不能放行断点
             fallback = self._write_fallback(working, kind, reason, summary, content)
             # 断点写失败同样视为本轮执行结束：先收回写权限，避免继续写。
+            # 只改内存快照；失败状态落盘由 PR-3 处理。
             self._revoke_write_lease(state, "checkpoint write failed")
             self._state = state
             raise CheckpointWriteError(
@@ -408,7 +446,16 @@ class LongRunAgent:
         working.checkpoint_id = record_id
         working.checkpoint_memory_ids.append(record_id)
         working.updated_at = now_iso()
-        self.store.save(working)
+        with self.store.locked():
+            latest = self.store.load()
+            latest_revision = latest.revision if latest is not None else 0
+            if latest is None or latest_revision != base_revision:
+                raise StateConflict(
+                    f"断点记忆已写入（memory_id={record_id}），"
+                    "但状态文件在写入期间被其他进程修改。"
+                    "请先 resume() 对账，不要直接重试，以免重复断点。"
+                )
+            self.store.save(working, expected_revision=base_revision)
         self._state = working
 
         return Checkpoint(
@@ -455,29 +502,34 @@ class LongRunAgent:
 
         顺序：加载状态 → 校验/修复状态机 → 按需读最近断点原文 → 返回。
         """
-        state = self.store.load()
-        if state is None:
-            raise NoActiveTask(
-                "没有本地任务状态。若换过机器/删过 .longrun，"
-                "请用 recover_from_memory(关键词或任务ID) 从记忆库重建。"
-            )
-        if state.status in TERMINAL_STATUSES:
-            raise NoActiveTask(
-                f"任务 {state.task_id} 已结束（{state.status.value}），没有可恢复的进度。"
-            )
+        with self.store.locked():
+            state = self.store.load()
+            if state is None:
+                raise NoActiveTask(
+                    "没有本地任务状态。若换过机器/删过 .longrun，"
+                    "请用 recover_from_memory(关键词或任务ID) 从记忆库重建。"
+                )
+            if state.status in TERMINAL_STATUSES:
+                raise NoActiveTask(
+                    f"任务 {state.task_id} 已结束（{state.status.value}），"
+                    "没有可恢复的进度。"
+                )
 
-        working = TaskState.from_dict(state.to_dict())
-        if working.status in {
-            TaskStatus.PENDING,
-            TaskStatus.PAUSED,
-            TaskStatus.BLOCKED,
-            TaskStatus.WAITING_VERIFICATION,
-        }:
-            working.transition(TaskStatus.IN_PROGRESS, "resume")
+            working = TaskState.from_dict(state.to_dict())
+            if working.status in {
+                TaskStatus.PENDING,
+                TaskStatus.PAUSED,
+                TaskStatus.BLOCKED,
+                TaskStatus.WAITING_VERIFICATION,
+            }:
+                working.transition(TaskStatus.IN_PROGRESS, "resume")
 
-        # resume 是新的对话轮次：上一轮的写租约不能继承。
-        self._start_new_turn(working, "resume")
+            # resume 是新的对话轮次：上一轮的写租约不能继承。
+            self._start_new_turn(working, "resume")
+            self.store.save(working, expected_revision=state.revision)
+            self._state = working
 
+        # 断点原文与关联检索都是只读操作，放在锁外，避免慢 I/O 阻塞其它进程。
         checkpoint = None
         if working.checkpoint_id:
             try:
@@ -487,8 +539,6 @@ class LongRunAgent:
                 checkpoint = None
 
         related = self._safe_search(working.task_id)
-        self.store.save(working)
-        self._state = working
 
         summary = (
             f"已恢复任务 {working.task_id}（{working.status.value}）。"
@@ -539,7 +589,10 @@ class LongRunAgent:
             )
             # 从记忆重建也是新的对话轮次：旧标记里的 writable 一律作废。
             self._start_new_turn(state, "recover_from_memory")
-            self.store.save(state)
+            with self.store.locked():
+                current = self.store.load()
+                expected = current.revision if current is not None else 0
+                self.store.save(state, expected_revision=expected)
             self._state = state
 
             related = [r for r in rows if r.get("id") != record_id]
@@ -564,48 +617,68 @@ class LongRunAgent:
         宿主每收到一条新的用户消息时调用一次；`resume()` 已经相当于
         开始了一轮，不要对同一条消息重复调用。
         """
-        state = self._require_state()
-        if state.status in TERMINAL_STATUSES:
-            raise LongRunError("任务已结束，不能开始新的对话轮次。")
-        self._start_new_turn(state, reason or "begin_turn")
-        self.store.save(state)
-        self._state = state
-        return state
+        with self.store.locked():
+            state = self.store.load()
+            if state is None:
+                raise NoActiveTask("当前没有活动任务，先调用 start_task()。")
+            if state.status in TERMINAL_STATUSES:
+                raise LongRunError("任务已结束，不能开始新的对话轮次。")
+            self._start_new_turn(state, reason or "begin_turn")
+            self.store.save(state, expected_revision=state.revision)
+            self._state = state
+            return state
 
     def end_turn(self, reason: str = "") -> TaskState:
         """结束当前对话轮次。写权限立即收回，下一轮必须重新授权。"""
-        state = self._require_state()
-        if state.status in TERMINAL_STATUSES:
-            raise LongRunError("任务已结束，不能结束对话轮次。")
-        self._revoke_write_lease(state, reason or "end_turn")
-        state.note("turn end" + (f"（{reason}）" if reason else ""))
-        self.store.save(state)
-        self._state = state
-        return state
+        with self.store.locked():
+            state = self.store.load()
+            if state is None:
+                raise NoActiveTask("当前没有活动任务，先调用 start_task()。")
+            if state.status in TERMINAL_STATUSES:
+                raise LongRunError("任务已结束，不能结束对话轮次。")
+            self._revoke_write_lease(state, reason or "end_turn")
+            state.note("turn end" + (f"（{reason}）" if reason else ""))
+            self.store.save(state, expected_revision=state.revision)
+            self._state = state
+            return state
 
     def enable_writes(self, reason: str = "") -> TaskState:
         """在当前对话轮次内解锁写操作。
 
         v3 的写权限是单轮租约：只对 `state.turn_index` 有效。
         开始下一轮、checkpoint、resume 都会自动收回。
+
+        只有 `in_progress` 状态可以解锁；paused / blocked /
+        waiting_verification / 终态都不允许写。`reason` 必须非空，用于审计。
         """
-        state = self._require_state()
-        if state.status in TERMINAL_STATUSES:
-            raise LongRunError("任务已结束，不能再切换读写门禁。")
-        if state.turn_index <= 0:
-            # 兼容手工构造的旧状态：至少给它一个当前轮次。
-            state.turn_index = 1
-        previous = state.access_mode
-        state.access_mode = AccessMode.WRITABLE
-        state.write_lease_turn = state.turn_index
-        state.note(
-            f"access_mode: {previous.value} → writable "
-            f"(turn {state.turn_index})"
-            + (f"（{reason}）" if reason else "")
-        )
-        self.store.save(state)
-        self._state = state
-        return state
+        reason = (reason or "").strip()
+        if not reason:
+            raise LongRunError(
+                "enable_writes() 必须说明原因：写权限变更需要可审计的授权理由。"
+            )
+        with self.store.locked():
+            state = self.store.load()
+            if state is None:
+                raise NoActiveTask("当前没有活动任务，先调用 start_task()。")
+            if state.status is not TaskStatus.IN_PROGRESS:
+                raise LongRunError(
+                    f"当前状态 {state.status.value} 不允许解锁写权限；"
+                    "只有 in_progress 可以写。请先 resume() 回到执行态。"
+                )
+            if state.turn_index <= 0:
+                # 兼容手工构造的旧状态：至少给它一个当前轮次。
+                state.turn_index = 1
+            previous = state.access_mode
+            state.access_mode = AccessMode.WRITABLE
+            state.write_lease_turn = state.turn_index
+            state.note(
+                f"access_mode: {previous.value} → writable "
+                f"(turn {state.turn_index})"
+                + (f"（{reason}）" if reason else "")
+            )
+            self.store.save(state, expected_revision=state.revision)
+            self._state = state
+            return state
 
     def disable_writes(self, reason: str = "") -> TaskState:
         """手动回到对话态，并收回本轮写租约。"""
@@ -613,37 +686,51 @@ class LongRunAgent:
 
     def require_writable(self, action: str = "写操作") -> None:
         """执行任何修改代码/文件的操作前调用。"""
-        state = self._require_state()
-        if state.access_mode is not AccessMode.WRITABLE:
-            raise WriteGateViolation(
-                f"当前是只读/对话态，拒绝执行「{action}」。"
-                "先完成调研并调用 enable_writes(原因) 显式解锁。"
-            )
-        if state.write_lease_turn != state.turn_index:
-            leased_turn = state.write_lease_turn
-            # 手工改过状态 / 旧版本遗留：宁可报错，也不放行过期租约。
-            self._revoke_write_lease(state, "stale write lease")
-            raise WriteGateViolation(
-                f"「{action}」被拒绝：写权限已过期"
-                f"（授权轮次 {leased_turn}，当前轮次 {state.turn_index}）。"
-                "请在当前轮次重新调用 enable_writes(原因)。"
-            )
+        # 门禁必须读磁盘上的最新状态：另一个进程可能刚把任务 pause 或
+        # 收回了租约，内存缓存不能作为放行依据。
+        with self.store.locked():
+            state = self.store.load()
+            if state is None:
+                raise NoActiveTask("当前没有活动任务，先调用 start_task()。")
+            self._state = state
+            if state.status is not TaskStatus.IN_PROGRESS:
+                raise WriteGateViolation(
+                    f"「{action}」被拒绝：当前状态 {state.status.value} 不允许写操作。"
+                    "只有 in_progress 可以写；请先 resume() 并重新 enable_writes(原因)。"
+                )
+            if state.access_mode is not AccessMode.WRITABLE:
+                raise WriteGateViolation(
+                    f"当前是只读/对话态，拒绝执行「{action}」。"
+                    "先完成调研并调用 enable_writes(原因) 显式解锁。"
+                )
+            if state.write_lease_turn != state.turn_index:
+                leased_turn = state.write_lease_turn
+                # 手工改过状态 / 旧版本遗留：宁可报错，也不放行过期租约。
+                self._revoke_write_lease(state, "stale write lease")
+                raise WriteGateViolation(
+                    f"「{action}」被拒绝：写权限已过期"
+                    f"（授权轮次 {leased_turn}，当前轮次 {state.turn_index}）。"
+                    "请在当前轮次重新调用 enable_writes(原因)。"
+                )
 
     def _set_access_mode(self, mode: AccessMode, reason: str) -> TaskState:
-        state = self._require_state()
-        if state.status in TERMINAL_STATUSES:
-            raise LongRunError("任务已结束，不能再切换读写门禁。")
-        previous = state.access_mode
-        state.access_mode = mode
-        if mode is AccessMode.READ_ONLY:
-            state.write_lease_turn = None
-        state.note(
-            f"access_mode: {previous.value} → {mode.value}"
-            + (f"（{reason}）" if reason else "")
-        )
-        self.store.save(state)
-        self._state = state
-        return state
+        with self.store.locked():
+            state = self.store.load()
+            if state is None:
+                raise NoActiveTask("当前没有活动任务，先调用 start_task()。")
+            if state.status in TERMINAL_STATUSES:
+                raise LongRunError("任务已结束，不能再切换读写门禁。")
+            previous = state.access_mode
+            state.access_mode = mode
+            if mode is AccessMode.READ_ONLY:
+                state.write_lease_turn = None
+            state.note(
+                f"access_mode: {previous.value} → {mode.value}"
+                + (f"（{reason}）" if reason else "")
+            )
+            self.store.save(state, expected_revision=state.revision)
+            self._state = state
+            return state
 
     # -- 决策记录 -----------------------------------------------------------
 
@@ -685,10 +772,14 @@ class LongRunAgent:
 
     # -- 内部 ---------------------------------------------------------------
 
-    def _require_state(self) -> TaskState:
-        if self._state is None:
-            raise NoActiveTask("当前没有活动任务，先调用 start_task()。")
-        return self._state
+    @staticmethod
+    def _ensure_no_active_task(state: TaskState | None) -> None:
+        """磁盘上已有未完成任务时拒绝覆盖；终态任务允许被新任务替换。"""
+        if state is not None and state.status not in TERMINAL_STATUSES:
+            raise LongRunError(
+                f"已有未完成任务 {state.task_id}（{state.status.value}）。"
+                "请先 resume() 继续，或 finish() 结束，不要直接覆盖。"
+            )
 
     def _revoke_write_lease(self, state: TaskState, reason: str) -> bool:
         """收回写租约，返回是否确实收回。只改内存，由调用方负责落盘。"""

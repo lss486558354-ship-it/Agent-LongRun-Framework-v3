@@ -25,8 +25,8 @@ LongRunAgent(root=项目根)
        ├─ 铁律一：search_memory（只查本项目）
        ├─ 按需 read_raw_data
        └─ 状态 pending → in_progress，门禁 read_only
-             │
-             ├─ 调研完成 → enable_writes(原因)   # 只解锁当前轮
+             │                         # start_task 没有 access_mode 参数
+             ├─ 调研完成 → enable_writes(原因)   # 仅 in_progress，只解锁当前轮
              ├─ 实施
              ├─ 下一条用户消息 → begin_turn()    # 收回上一轮写权限
              ├─ 阶段完成 → phase-completion-archive
@@ -166,6 +166,8 @@ LongRunAgent(root=项目根)
 - ❌ 只写「继续做」，没写下一步和已完成
 - ❌ 恢复时跳过状态校验，直接按聊天记忆干活
 - ❌ 只读模式下改文件
+- ❌ 给 `start_task()` 传 `access_mode=writable`（会直接报错）
+- ❌ 在 `paused` / `blocked` / `waiting_verification` 状态调用 `enable_writes()`
 - ❌ 把一次 `enable_writes()` 当成持久开关，跨轮次继续写
 - ❌ 记忆服务报错，静默按「无历史」推进
 - ❌ 把整段正文塞进摘要，破坏冷热分离
@@ -175,7 +177,8 @@ LongRunAgent(root=项目根)
 
 - [ ] `LongRunAgent(root=...)` 与 MCP `--project_path` 指向同一个项目
 - [ ] 任务开始前有 `search_memory` 调用记录
-- [ ] 新任务门禁为 `read_only`
+- [ ] 新任务门禁为 `read_only`，且 `start_task()` 未传 `access_mode`
+- [ ] `enable_writes()` 只在 `in_progress` 且原因非空时调用
 - [ ] 写操作前调用过 `require_writable`
 - [ ] 写权限只在当前轮有效；断点/恢复/换轮后重新 `enable_writes`
 - [ ] 每个断点都有 memory_id
