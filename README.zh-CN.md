@@ -6,6 +6,9 @@
 
 任务开始先查记忆 → 执行受状态机与单轮写租约约束 → 中断/阶段完成时先写记忆，再输出断点。
 
+> **配套记忆路由器：** [`agent-memory-router-v2`](https://github.com/lss486558354-ship-it/agent-memory-router-v2)
+> —— 每个项目独立的 SQLite 记忆库 + 原文目录，本框架默认用它作为记忆后端。
+
 > 不是又一个 Agent 框架。没有 LLM 调用、没有编排 DSL，只有一层很薄的胶水：
 > 让「执行」和「记忆」互为前提。
 >
@@ -157,7 +160,7 @@ cd Agent-LongRun-Framework-v3
 python -m pip install -e ".[dev]"
 python -m pip install -e ../agent-memory-router-v2
 
-python -m pytest tests/ -q                    # 52 passed
+python -m pytest tests/ -q                    # 73 passed, 1 skipped
 python examples/01_interrupted_task.py        # 本地后端
 python examples/01_interrupted_task.py --mcp  # 真实 MCP stdio
 ```
@@ -383,7 +386,7 @@ Agent-LongRun-Framework-v3/
 ├── memory_client.py        # 三种记忆后端（MCP / Local / InMemory），绑定项目根
 ├── workflow_manager.py     # LongRunAgent：start / checkpoint / resume / finish
 ├── cli.py                  # agent-longrun demo
-├── tests/                  # 52 个行为测试
+├── tests/                  # 73 个行为测试（1 skipped）
 ├── examples/               # 中断恢复、阶段归档两个可运行示例
 ├── rules/                  # 四份可复用规则
 ├── skills/auto-dev-workflow/SKILL.md
@@ -392,6 +395,52 @@ Agent-LongRun-Framework-v3/
 ├── README.md               # English
 └── README.zh-CN.md         # 简体中文
 ```
+
+## 安全与白帽挑战
+
+V3 已修复 P0 的写门禁与状态文件并发问题（单轮写租约、跨进程 `state.lock`、
+唯一临时文件、`revision/CAS`）。下面公开两个更深层的 Agent 原生靶子，邀请白帽
+研究者来打。它们是设计级挑战，不代表当前代码已经安全。请先走私密渠道提交最小
+PoC；不要在公开 issue 里贴可直接运行的利用。
+
+### 靶子 1 · 断点标记注入（悬赏）
+
+**不变量。** 一条 checkpoint 记录里只能有一个可信的机器状态标记。
+`recover_from_memory()` 必须恢复真实任务或报错，不能采用攻击者指定的标记。
+
+**挑战。** 只用公开 API，在 `task_desc`、`phase`、`summary`、`next_step`、
+`decisions` 中构造输入，使本地状态丢失后，`recover_from_memory()` 返回攻击者
+指定的 `task_id` 或 `next_step`。相关代码：`workflow_manager._render_checkpoint()`、
+`workflow_manager._STATE_MARKER_RE`、`LongRunAgent.recover_from_memory()`。
+
+**验收。** 最小 PoC + 一个在当前代码上失败、修复后通过的 pytest。附带具体修复
+方案者优先。
+
+### 靶子 2 · 断点孤儿（挑战）
+
+**不变量。** 未通过状态 CAS 的 checkpoint 记忆，不得在恢复时被当作有效断点。
+
+**场景。** 两个 Agent 同时 checkpoint：一个 CAS 成功，另一个失败；失败方的
+session 记录已经留在记忆库里。请给出可重复的时序，证明 `recover_from_memory()`
+会选中失败记录，或证明为什么不会。相关代码：`LongRunAgent.checkpoint()` 的 CAS
+提交、`LongRunAgent.recover_from_memory()` 的候选选择。
+
+**验收。** 最小并发时序 + 可重复的失败测试。能给出 commit proof / 幂等键设计的
+加分。
+
+### 奖励与报告
+
+- 奖励按提交质量协商（现金 / 项目 credit，可两者兼得）；在投入完整报告前，先在
+  私密渠道确认金额。
+- 通过 GitHub Security Advisories / Private vulnerability reporting 提交；修复前
+  请勿公开完整 PoC。
+- 我们争取 72 小时内确认，90 天内协调披露。披露后公开致谢。
+
+### 范围说明
+
+同机、同用户下能替换 `.longrun/state.lock` 或直接修改 `.longrun/state.json` 的
+进程，不在应用层威胁模型内。我们会用 inode 校验、`O_NOFOLLOW`、epoch 和部署
+隔离加固这条路径，但它不是本次悬赏靶子。
 
 ## 测试
 
@@ -422,7 +471,8 @@ python -m pytest tests/ -q
 - 每次 MCP 调用都会拉起子进程，高频检索场景需要长连接或本地后端
 - `LocalMemoryBackend` 的项目根是模块级全局配置，同一进程不能并行切项目
 - 关键词提取是启发式的，没有语义向量
-- 状态文件没有加锁，同一 `.longrun/` 不支持并发写
+- 同一 `.longrun/` 的并发写由 `.longrun/state.lock` 串行化；
+  遇到 `StateConflict` 说明另一写入者已胜出，应重新加载并对齐，不要拿旧快照盲目重试
 - 目前是同步 API；异步场景需要线程池包装
 - Windows 控制台需要 `PYTHONIOENCODING=utf-8`，示例已内置重配置
 

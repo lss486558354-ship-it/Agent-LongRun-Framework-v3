@@ -3,13 +3,16 @@
 English | [简体中文](README.zh-CN.md)
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-52%20passed-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-73%20passed-brightgreen)](tests/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![MCP](https://img.shields.io/badge/MCP-stdio-6f42c1)](https://modelcontextprotocol.io)
 
 Runtime contracts for long-running LLM agents: a 7-state task machine, a
 **single-turn write lease**, and project-scoped memory — coupled so that
 execution and memory are each other's precondition.
+
+> **Companion MCP server:** [`agent-memory-router-v2`](https://github.com/lss486558354-ship-it/agent-memory-router-v2)
+> — project-scoped SQLite memory plus raw data, used as the default memory backend.
 
 > **Core idea: an agent session works like a product review.**
 > **Conversational state (read-only)** is where you align on scope — clarify the
@@ -116,7 +119,7 @@ cd Agent-LongRun-Framework-v3
 python -m pip install -e ".[dev]"
 python -m pip install -e ../agent-memory-router-v2
 
-python -m pytest tests/ -q                    # 52 passed
+python -m pytest tests/ -q                    # 73 passed, 1 skipped
 python examples/01_interrupted_task.py        # in-process backend
 python examples/01_interrupted_task.py --mcp  # real MCP stdio
 ```
@@ -340,9 +343,64 @@ to be embedded, not to own your runtime.
   persistent connection or the local backend.
 - `LocalMemoryBackend` uses a process-global project root.
 - Keyword extraction is heuristic; there are no embeddings.
-- The state file has no lock; concurrent writers on one `.longrun/` are unsupported.
+- Concurrent writers on one `.longrun/` are serialized by `.longrun/state.lock`;
+  `StateConflict` means another writer won the race — reload and reconcile
+  instead of retrying a stale snapshot.
 - The API is synchronous; wrap it in a thread pool for async hosts.
 - Windows consoles need `PYTHONIOENCODING=utf-8`; examples reconfigure stdout.
+
+## Security & white-hat challenge
+
+V3 has fixed the P0 write-gate and state-file concurrency issues (single-turn
+lease, cross-process `state.lock`, unique temp file, `revision/CAS`). We are
+now publishing two deeper, agent-native targets for white-hat review. These are
+design-level challenges, not a claim that the current code is safe. Please send
+a minimal PoC privately first; do not open a public issue with a working exploit.
+
+### Target 1 — checkpoint marker injection (bounty)
+
+**Invariant.** A checkpoint record must contain exactly one trusted machine
+marker. `recover_from_memory()` must restore the real task or fail; it must
+never adopt an attacker-chosen marker.
+
+**Challenge.** Using only the public API, craft input in `task_desc`, `phase`,
+`summary`, `next_step`, or `decisions` so that after local state is lost,
+`recover_from_memory()` returns an attacker-chosen `task_id` or `next_step`.
+Relevant code: `workflow_manager._render_checkpoint()`,
+`workflow_manager._STATE_MARKER_RE`, `LongRunAgent.recover_from_memory()`.
+
+**Acceptance.** A minimal PoC plus a pytest that fails on the current code and
+passes after the fix. A concrete fix proposal is welcome.
+
+### Target 2 — orphan checkpoint after a failed CAS (challenge)
+
+**Invariant.** A checkpoint memory that did not pass the state CAS must never
+be treated as a valid checkpoint during recovery.
+
+**Scenario.** Two agents checkpoint concurrently. One wins the CAS; the other
+fails, but the loser's session record is already in the memory store. Show a
+reproducible timing in which `recover_from_memory()` selects the failed record,
+or prove why it cannot. Relevant code: `LongRunAgent.checkpoint()` (CAS commit)
+and `LongRunAgent.recover_from_memory()` (candidate selection).
+
+**Acceptance.** A minimal concurrent timeline plus a repeatable failing test.
+A commit-proof / idempotency-key design is a bonus.
+
+### Rewards and reporting
+
+- Reward is negotiated per submission (cash, project credit, or both); we will
+  confirm the amount in the private channel before you invest in a full writeup.
+- Report via GitHub Security Advisories / private vulnerability reporting.
+  Do not publish a full PoC before a fix is available.
+- We aim to acknowledge within 72 hours and coordinate disclosure within
+  90 days. Credit is given publicly after disclosure.
+
+### Scope note
+
+A same-host, same-user process that can replace `.longrun/state.lock` or edit
+`.longrun/state.json` directly is outside the application-level threat model.
+We will harden that path with inode checks, `O_NOFOLLOW`, epochs, and deployment
+isolation, but it is not one of the bounty targets.
 
 ## Tests
 

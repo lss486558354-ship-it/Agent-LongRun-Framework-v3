@@ -1,6 +1,6 @@
 # PROJECT_INDEX
 
-> 最后更新：2026-11-04（v0.3 单轮写租约）
+> 最后更新：2026-11-15（v2/v3 交叉链接 + v2 Topics）
 > 维护规则：每次代码修改后追加「修改历史」，并刷新此处。
 
 ## 1. 项目基本信息
@@ -61,9 +61,14 @@ Agent-LongRun-Framework-v3/
 - `AccessMode`：`read_only` / `writable`
 - `TRANSITIONS`：白名单流转；`completed`、`failed` 无出口
 - `TaskState`：任务上下文（描述、阶段、已完成步骤、决策、断点 id、history、
-  `turn_index`、`write_lease_turn`）
-- `StateStore(root)`：`<root>/.longrun/state.json` 原子读写（tmp → replace），损坏抛 `StateCorruptError`
-- `transition()` 校验流转并记录 history，最多保留 20 条
+  `turn_index`、`write_lease_turn`、`revision`）
+- `StateStore(root, lock_timeout=10.0)`：`<root>/.longrun/state.json` 热状态；
+  `.longrun/state.lock` 跨进程锁；唯一 `state.<pid>.<uuid>.json.tmp` +
+  `os.replace`；`revision/CAS` 防丢失更新；损坏抛 `StateCorruptError`，
+  冲突抛 `StateConflict`，锁超时抛 `StateLockTimeout`
+- `load()` 在文件存在时也持锁，避免 Windows `os.replace` 与打开中的句柄冲突
+- `transition()` 校验流转、记录 history（最多 20 条），并强制收回写租约；
+  `__post_init__()` / `from_dict()` 归一化非 `in_progress` 状态的 writable 租约
 
 ### memory_client.py
 
@@ -85,23 +90,26 @@ Agent-LongRun-Framework-v3/
   - `StateStore(project_root)`
   - 默认 `MCPMemoryBackend(project_path=project_root)`
   - 保证热状态与冷记忆属于同一个项目
-- `start_task()`：拒绝覆盖未完成任务 → 检索 → hydrate → `PENDING→IN_PROGRESS`
-  → `turn_index=1` → 落盘
-- `checkpoint()`：收回写租约 → 副本上改状态 → 渲染（含
-  `<!-- longrun-state: {...} -->`）→ `save_memory` → 成功后更新状态与
-  `checkpoint_id` → 返回
+- `start_task()`：锁内检查磁盘未完成任务 → 检索 → hydrate →
+  `PENDING→IN_PROGRESS` → 锁内复查并落盘；固定 `read_only`，不接受
+  `access_mode`（旧调用硬报错）
+- `checkpoint()`：锁内快照 → 收回写租约 → 副本上改状态 → 渲染（含
+  `<!-- longrun-state: {...} -->`）→ 锁外 `save_memory` → 锁内按
+  `base_revision` CAS 提交状态与 `checkpoint_id` → 返回；期间被改抛
+  `StateConflict`，不覆盖
 - 失败：写 `.longrun/pending_checkpoint.json`，抛 `CheckpointWriteError`，不返回断点
 - `complete_phase()`：状态保持 `in_progress`，阶段写入 `completed_steps`
 - `finish()`：归档后进 `completed`
 - `note_blocked()`：`blocked`
-- `resume()`：读本地状态 → `_start_new_turn`（收回租约、`turn_index+1`）→
-  修到 `in_progress` → 读断点原文 → 搜索关联
+- `resume()`：锁内读本地状态 → `_start_new_turn`（收回租约、`turn_index+1`）→
+  修到 `in_progress` → 锁内落盘；锁外读断点原文 → 搜索关联
 - `recover_from_memory()`：搜索 session → 读原文 → 正则解析机器标记 → 重建状态
   → `_start_new_turn`（强制 `read_only`）
 - 门禁：`enable_writes / disable_writes / require_writable`；
-  `begin_turn / end_turn` 管理轮次边界
-- 单轮写租约：`enable_writes()` 设 `write_lease_turn=turn_index`；
-  `require_writable()` 同时校验模式与轮次，过期即拒绝
+  `begin_turn / end_turn` 管理轮次边界；所有状态变更在锁内重新读盘
+- 单轮写租约：`enable_writes()` 仅在 `in_progress` 且原因非空时设置
+  `write_lease_turn=turn_index`；`require_writable()` 从磁盘读取最新状态，
+  同时校验状态、模式与轮次，非执行状态或过期租约即拒绝
 - `save_decision()`：写 `decision`，与断点建 `related_to`
 - `extract_keywords()`：拉丁词 + 中文二字滑窗，过滤停用词与全虚词片段
 
@@ -113,12 +121,12 @@ LongRunAgent(root=项目根)
   → start_task
       → Memory.search（只查 <项目根>/memory.db）
       → Memory.read_raw（top 1）
-      → StateStore.save（<项目根>/.longrun/state.json）
+      → StateStore.save（锁内 CAS，revision+1，<项目根>/.longrun/state.json）
   → 执行（read_only → enable_writes → writable，仅当前 turn_index）
   → checkpoint
       → 收回写租约（writable → read_only）
       → Memory.save（session，正文含机器标记）
-      → StateStore.save（status / checkpoint_id / turn_index）
+      → StateStore.save（锁内 CAS，status / checkpoint_id / turn_index / revision）
       → 返回断点
   → 新用户消息 begin_turn（turn_index+1，收回租约）
   → resume / recover_from_memory（必须使用同一个 root；强制 read_only）
@@ -189,12 +197,59 @@ env = PYTHONIOENCODING=utf-8, PYTHONUTF8=1
 - 新增 `CHANGELOG.md` 与 GitHub Actions（Python 3.10–3.12）
 - 测试总数 52；示例与 demo 全部跑通
 
+### 2026-11-14 · v0.3 写门禁不变量（PR-1）
+
+- `start_task()` 删除公开 `access_mode` 参数；传入即 `LongRunError`，不存在启动即写
+- `enable_writes()` 仅允许 `in_progress` 且 `reason` 非空
+- `require_writable()` 增加 `status is in_progress` 校验
+- `TaskState.transition()` 在任何状态流转后强制收回写租约；
+  `__post_init__()` / `from_dict()` 归一化非执行状态的 writable 租约
+- 新增 14 个测试用例，其中 12 个在旧代码上失败；测试总数 66 passed + 1 skipped
+- 更新 `rules/00-entry.md`、`rules/03-execution-boundary.md`、
+  `skills/auto-dev-workflow/SKILL.md`
+- 备份：`.backups/20261114_v3-fix/`；问题记录：`BUG_DESCRIPTION.md`
+
+### 2026-11-14 · 状态文件并发安全（PR-2）
+
+- `StateStore` 新增 `.longrun/state.lock` 跨进程锁（Windows `msvcrt` /
+  POSIX `fcntl`），默认 10s 超时、50ms 轮询；锁文件永不删除
+- 保存改为唯一 `state.<pid>.<uuid>.json.tmp` + `os.replace`
+- `TaskState` 新增 `revision`；`StateStore.save(expected_revision=...)` 做 CAS，
+  冲突抛 `StateConflict`，失败回滚内存 revision
+- `load()` 在文件存在时也持锁，避免 Windows `os.replace` 与打开句柄冲突
+- 所有读-改-写路径锁内重新读盘；`start_task` 检索前后双重检查；
+  `checkpoint` 锁外写记忆 + 锁内 CAS 提交
+- 新增 7 个并发/冲突测试；73 passed + 1 skipped；多进程三件套连续 10 轮通过；
+  ruff 全绿
+- 备份：`.backups/20261114_v3-fix-pr2/`；`rules/03-execution-boundary.md`
+  新增「状态文件并发」小节
+
+### 2026-11-14 · 白帽悬赏文案（只改文档）
+
+- `README.md` / `README.zh-CN.md` 新增「Security & white-hat challenge /
+  安全与白帽挑战」：靶子 1 断点标记注入（悬赏）、靶子 2 断点孤儿（挑战）；
+  `.longrun/state.lock` 替换列为应用层威胁模型之外，不作为悬赏
+- `RELEASE_NOTES_v0.3.0.md` 同步悬赏摘要
+- README 测试计数从 52 更新为 73 passed + 1 skipped；修正「状态文件没有加锁」
+  的过期描述（PR-2 已加 `state.lock`、唯一 tmp、`revision/CAS`）
+- 本轮只改文档，不改源码；任务保持 `in_progress` / `read_only`
+- 备份：`.backups/20261114_bounty-docs/`
+
+### 2026-11-15 · v2/v3 交叉链接与 v2 Topics
+
+- `README.md` / `README.zh-CN.md` 顶部新增指向 `agent-memory-router-v2` 的配套记忆路由器链接
+- `agent-memory-router-v2` README 顶部新增指向本框架的交叉链接
+- 为 `agent-memory-router-v2` 补 GitHub Topics：mcp、mcp-server、ai-agents、llm、memory、
+  sqlite、local-first、python、long-context、agent-memory
+- 同步更新 v2/v3 的 `PROJECT_INDEX.md`；未改源码
+- 备份：`.backups/20261115_crosslink/`（v3）、
+  `agent-memory-router-v2/.backups/20261115_crosslink/`（v2）
+
 ## 8. 技术债务
 
 | 级别 | 项 | 说明 |
 |------|----|------|
 | 中 | MCP 每次调用拉子进程 | 高频检索需长连接或 Local 后端 |
-| 中 | 状态文件无并发锁 | 同一 `<项目根>/.longrun` 不支持多进程同时写 |
 | 中 | 关键词提取为启发式 | 无向量/语义召回，长尾同义词会漏 |
 | 中 | `LocalMemoryBackend` 项目根是模块全局 | 同进程不能并行切项目；生产走多个 MCP 子进程 |
 | 低 | 同步 API | 异步场景需线程池包装 |
