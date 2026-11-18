@@ -1,6 +1,6 @@
 # PROJECT_INDEX
 
-> 最后更新：2026-11-18（v0.4 断点提交协议与恢复可靠性）
+> 最后更新：2026-11-18（v0.4.1 发布收尾：lint 与测试口径）
 > 维护规则：每次代码修改后追加「修改历史」，并刷新此处。
 
 ## 1. 项目基本信息
@@ -8,7 +8,7 @@
 | 项 | 内容 |
 |----|------|
 | 名称 | Agent-LongRun-Framework |
-| 版本 | 0.4.0 |
+| 版本 | 0.4.1 |
 | 定位 | 把 Agent 执行状态机与项目级 MCP 记忆路由耦合的长任务工作流；单轮写租约 + state CAS 断点提交协议 |
 | 语言 | Python 3.10+（开发环境 3.12.0） |
 | 依赖 | `mcp>=2.0,<3.0`；开发依赖 pytest、ruff |
@@ -293,10 +293,24 @@ env = PYTHONIOENCODING=utf-8, PYTHONUTF8=1
 - `InMemoryBackend.read_raw()` 在原文缺失时抛 `MemoryBackendError`，不再泄漏
   `KeyError`
 - 新增 `tests/test_v4_protocol.py`、`tests/test_v4_recovery.py`，重写
-  `tests/test_target2_orphan_checkpoint.py`；106 passed + 1 skipped
+  `tests/test_target2_orphan_checkpoint.py`；107 collected，
+  router 缺失时 1 个条件 skip
 - 更新 `CLAUDE.md`、`.cursorrules`、rules、skill、README（中英）、
   `CHANGELOG.md`、`RELEASE_NOTES_v0.4.0.md`、`pyproject.toml`（0.4.0）；
   备份：`.backups/20261118_v4/`；问题记录：`BUG_DESCRIPTION.md`
+
+### 2026-11-18 · v0.4.1 发布收尾（lint 与测试口径）
+
+- `ruff check .` 修复 2 项风格问题，提交协议、恢复顺序、journal 语义与
+  公开 API 均不变：
+  - `state_machine.py` journal 覆盖检查的 SIM102 嵌套 `if` 合并条件
+  - `workflow_manager.py` best-effort journal 写入改用
+    `contextlib.suppress(Exception)`（SIM105）
+- 修正测试口径：总收集 107 项；`tests/test_cli.py` 仅在
+  `agent-memory-router` 不可导入时 skip。README（中英）、`CHANGELOG.md`、
+  `RELEASE_NOTES_v0.4.0.md`、`PROJECT_INDEX.md` 已同步
+- 新增 `RELEASE_NOTES_v0.4.1.md`；版本号 `0.4.1`
+- 备份：`.backups/20261118_v4.1/`；问题记录：`BUG_DESCRIPTION.md`
 
 ## 8. 技术债务
 
@@ -314,7 +328,7 @@ env = PYTHONIOENCODING=utf-8, PYTHONUTF8=1
 ## 9. 验证命令
 
 ```bash
-python -m pytest tests/ -q        # 106 passed, 1 skipped
+python -m pytest tests/ -q        # 107 passed（router 已安装）；缺失时 106 + 1 skip
 python -m cli demo
 python examples/01_interrupted_task.py
 python examples/01_interrupted_task.py --mcp

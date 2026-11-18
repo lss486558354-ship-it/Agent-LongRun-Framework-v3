@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-longrun-framework"
-version = "0.4.0"
+version = "0.4.1"
 description = "Runtime contracts for long-running LLM agents: state machine, single-turn write lease, and project-scoped memory."
 readme = "README.md"
 requires-python = ">=3.10"

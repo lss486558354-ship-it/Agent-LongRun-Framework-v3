@@ -4,6 +4,21 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.4.1] - 2026-11-18
+
+### Fixed
+
+- `ruff check .` now passes. This is a style-only release: the two SIM
+  findings are rewritten without changing the checkpoint protocol, recovery
+  order, journal semantics, or public API.
+
+### Documentation
+
+- Test counts now state **107 collected** and note that
+  `tests/test_cli.py` skips only when `agent-memory-router` is not importable.
+  With the router installed, all 107 tests run.
+- Added `RELEASE_NOTES_v0.4.1.md`.
+
 ## [0.4.0] - 2026-11-18
 
 ### Added
@@ -24,8 +39,8 @@ and the project uses [Semantic Versioning](https://semver.org/).
 - New errors: `CheckpointArchiveError`, `PendingArchiveError`,
   `StatePendingError`, `ArchivePayloadMissing`, `AmbiguousRecovery`,
   `ActiveTaskExists`, `StateBehindJournal`, `LegacyPendingCheckpoint`.
-- `tests/test_v4_protocol.py` and `tests/test_v4_recovery.py` (106 tests total,
-  1 skipped).
+- `tests/test_v4_protocol.py` and `tests/test_v4_recovery.py` (107 tests
+  collected; `test_cli` skips only when the router is not importable).
 
 ### Changed
 

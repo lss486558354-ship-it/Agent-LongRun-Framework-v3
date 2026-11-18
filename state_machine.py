@@ -628,17 +628,16 @@ class StateStore:
                 new_key = payload.get("checkpoint_key")
                 old_seq = existing.get("commit_seq")
                 new_seq = payload.get("commit_seq")
-                if old_key != new_key:
-                    if (
-                        old_seq is not None
-                        and new_seq is not None
-                        and int(old_seq) >= int(new_seq)
-                    ):
-                        raise StateConflict(
-                            "已存在更新的 checkpoint journal "
-                            f"(key={old_key!r}, commit_seq={old_seq!r})；"
-                            "请先 resume() 或 retry_pending_checkpoint() 对账。"
-                        )
+                if old_key != new_key and (
+                    old_seq is not None
+                    and new_seq is not None
+                    and int(old_seq) >= int(new_seq)
+                ):
+                    raise StateConflict(
+                        "已存在更新的 checkpoint journal "
+                        f"(key={old_key!r}, commit_seq={old_seq!r})；"
+                        "请先 resume() 或 retry_pending_checkpoint() 对账。"
+                    )
             self._atomic_write_json(self.journal_path, payload)
             return self.journal_path
 

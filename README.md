@@ -156,7 +156,7 @@ cd Agent-LongRun-Framework-v3
 python -m pip install -e ".[dev]"
 python -m pip install -e ../agent-memory-router-v2
 
-python -m pytest tests/ -q                    # 106 passed, 1 skipped
+python -m pytest tests/ -q                    # 107 passed (router installed)
 python examples/01_interrupted_task.py        # in-process backend
 python examples/01_interrupted_task.py --mcp  # real MCP stdio
 ```

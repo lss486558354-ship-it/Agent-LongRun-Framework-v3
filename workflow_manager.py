@@ -35,6 +35,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -590,11 +591,10 @@ class LongRunAgent:
             "payload_degraded": False,
             "created_at": now_iso(),
         }
-        try:
+        with contextlib.suppress(Exception):
+            # journal 是 best-effort 恢复凭证：已提交的 state 仍是权威；
+            # archive 失败时还可以从 state 降级渲染。
             self.store.write_journal(journal_payload)
-        except Exception:  # noqa: BLE001 - journal 是 best-effort 恢复凭证
-            # 已提交的 state 仍是权威；archive 失败时还可以从 state 降级渲染。
-            pass
 
         try:
             record = self._archive_checkpoint(working, title, keywords, content)

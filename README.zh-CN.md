@@ -173,7 +173,7 @@ cd Agent-LongRun-Framework-v3
 python -m pip install -e ".[dev]"
 python -m pip install -e ../agent-memory-router-v2
 
-python -m pytest tests/ -q                    # 106 passed, 1 skipped
+python -m pytest tests/ -q                    # 107 passed（已安装 router）
 python examples/01_interrupted_task.py        # 本地后端
 python examples/01_interrupted_task.py --mcp  # 真实 MCP stdio
 ```
@@ -401,7 +401,7 @@ Agent-LongRun-Framework-v3/
 ├── memory_client.py        # 三种记忆后端（MCP / Local / InMemory），绑定项目根
 ├── workflow_manager.py     # LongRunAgent：start / checkpoint / resume / finish
 ├── cli.py                  # agent-longrun demo
-├── tests/                  # 106 个行为测试（1 skipped）
+├── tests/                  # 107 个行为测试（router 缺失时 1 个条件 skip）
 ├── examples/               # 中断恢复、阶段归档两个可运行示例
 ├── rules/                  # 四份可复用规则
 ├── skills/auto-dev-workflow/SKILL.md

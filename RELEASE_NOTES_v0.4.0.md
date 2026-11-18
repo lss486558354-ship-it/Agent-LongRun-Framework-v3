@@ -23,8 +23,9 @@ writes.
   archive is repaired. Turn lifecycle and `status()` still work.
 - **Marker injection closed.** User-visible text and the serialized marker JSON
   escape `<!--` / `-->`; only exactly one marker is trusted.
-- **106 tests** (1 skipped), including a dedicated post-CAS failure and
-  recovery suite.
+- **107 tests collected**; `test_cli` skips only when
+  `agent-memory-router` is not importable. Includes a dedicated post-CAS
+  failure and recovery suite.
 
 ## Protocol
 
