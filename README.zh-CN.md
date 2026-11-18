@@ -4,7 +4,8 @@
 
 把「Agent 执行状态机」和「MCP 记忆路由」耦合成一条可中断、可恢复、可审计的长任务流水线。
 
-任务开始先查记忆 → 执行受状态机与单轮写租约约束 → 中断/阶段完成时先提交 state、再归档记忆、最后输出断点。
+任务开始先查记忆 → 执行受状态机与单轮写租约约束 → 中断/阶段完成时先提交 state
+（唯一提交点）、再写 journal 与归档记忆、最后输出断点。
 
 > **配套记忆路由器：** [`agent-memory-router-v2`](https://github.com/lss486558354-ship-it/agent-memory-router-v2)
 > —— 每个项目独立的 SQLite 记忆库 + 原文目录，本框架默认用它作为记忆后端。
@@ -32,7 +33,7 @@
 
 ![agent-longrun demo](docs/demo.gif)
 
-*`agent-longrun demo`：只读 → 授权 → 断点 → 恢复 → 租约失效 → 重新授权。*
+*`agent-longrun demo`：只读 → 授权 → 断点（state CAS → journal → 归档）→ 恢复 → 租约失效 → 重新授权。*
 
 ## 解决什么问题
 

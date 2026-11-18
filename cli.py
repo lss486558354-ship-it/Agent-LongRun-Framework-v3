@@ -3,8 +3,9 @@
     agent-longrun demo
 
 The demo is intentionally self-contained: it creates a temporary project,
-runs a checkpoint, opens a new agent to resume it, and shows that the
-single-turn write lease does not survive the resume.
+runs a v4 checkpoint (state CAS -> journal -> archive), opens a new agent to
+resume it, and shows that the single-turn write lease does not survive the
+resume.
 """
 
 from __future__ import annotations
@@ -58,6 +59,12 @@ def run_demo() -> int:
         decisions=["read-only first"],
     )
     print(checkpoint.text)
+    print(
+        f"commit: seq={checkpoint.state.commit_seq} "
+        f"key={checkpoint.state.checkpoint_key[:8]} "
+        f"pending={checkpoint.state.archive_pending} "
+        f"journal={'present' if agent.store.journal_path.exists() else 'cleared'}"
+    )
 
     print("\n[4] new agent: resume")
     resumed = LongRunAgent(memory, root=home)

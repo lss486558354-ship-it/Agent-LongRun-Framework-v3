@@ -1,15 +1,16 @@
-# Agent-LongRun-Framework
+# Agent-LongRun-Framework v4
 
 English | [简体中文](README.zh-CN.md)
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-106%20passed-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-107%20collected-brightgreen)](tests/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![MCP](https://img.shields.io/badge/MCP-stdio-6f42c1)](https://modelcontextprotocol.io)
 
 Runtime contracts for long-running LLM agents: a 7-state task machine, a
-**single-turn write lease**, and project-scoped memory — coupled so that
-execution and memory are each other's precondition.
+**single-turn write lease**, project-scoped memory, and a **CAS-committed
+checkpoint protocol** — coupled so that execution and memory are each other's
+precondition.
 
 > **Companion MCP server:** [`agent-memory-router-v2`](https://github.com/lss486558354-ship-it/agent-memory-router-v2)
 > — project-scoped SQLite memory plus raw data, used as the default memory backend.
@@ -26,7 +27,7 @@ execution and memory are each other's precondition.
 
 ![agent-longrun demo](docs/demo.gif)
 
-*`agent-longrun demo` — read-only → lease → checkpoint → resume → stale lease rejected → finish.*
+*`agent-longrun demo` — read-only → lease → checkpoint (state CAS → journal → archive) → resume → stale lease rejected → finish.*
 
 Not another agent framework. No LLM calls, no orchestration DSL. It is a thin
 layer that answers three questions an agent runtime keeps getting wrong:
@@ -50,37 +51,6 @@ start_task → search memory → work under the state machine
           → checkpoint: state CAS first, archive memory second, print last
           → resume / recover on another process or machine
 ```
-
-## The single-turn write lease (v3)
-
-v2 shipped `enable_writes()` as a persistent switch. That is the wrong default:
-the user approves **one** action, and the agent keeps writing files in every
-later turn.
-
-v3 makes write permission a lease bound to a conversation turn:
-
-- `TaskState.turn_index` tracks the current turn.
-- `enable_writes(reason)` binds `write_lease_turn` to the current turn.
-- `begin_turn()` / `end_turn()` / `checkpoint()` / `resume()` /
-  `recover_from_memory()` all revoke the lease.
-- `require_writable()` checks both `access_mode` and `write_lease_turn`; a stale
-  lease raises `WriteGateViolation` even if `access_mode` still says `writable`.
-- A legacy v2 state that was `writable` is downgraded to `read_only` on load.
-
-```python
-agent.enable_writes("plan approved")
-agent.require_writable("edit adapters/xometry.py")   # OK, turn 1
-
-agent.begin_turn("next user message")
-agent.require_writable("keep editing")               # raises WriteGateViolation
-
-agent.enable_writes("new plan approved")
-agent.require_writable("keep editing")               # OK, turn 2
-```
-
-The host is responsible for calling `begin_turn()` when a new user message
-arrives — the framework cannot see message boundaries by itself. `resume()`
-already includes one `begin_turn`; do not call it twice for the same message.
 
 ## Checkpoint commit protocol (v4)
 
@@ -118,6 +88,37 @@ Properties:
 
 Durability promise: **process crash**, not power loss. State/journal use unique
 temp files plus `os.replace`; fsync/SQLite `synchronous=FULL` are out of scope.
+
+## The single-turn write lease (v3)
+
+v2 shipped `enable_writes()` as a persistent switch. That is the wrong default:
+the user approves **one** action, and the agent keeps writing files in every
+later turn.
+
+v3 makes write permission a lease bound to a conversation turn:
+
+- `TaskState.turn_index` tracks the current turn.
+- `enable_writes(reason)` binds `write_lease_turn` to the current turn.
+- `begin_turn()` / `end_turn()` / `checkpoint()` / `resume()` /
+  `recover_from_memory()` all revoke the lease.
+- `require_writable()` checks both `access_mode` and `write_lease_turn`; a stale
+  lease raises `WriteGateViolation` even if `access_mode` still says `writable`.
+- A legacy v2 state that was `writable` is downgraded to `read_only` on load.
+
+```python
+agent.enable_writes("plan approved")
+agent.require_writable("edit adapters/xometry.py")   # OK, turn 1
+
+agent.begin_turn("next user message")
+agent.require_writable("keep editing")               # raises WriteGateViolation
+
+agent.enable_writes("new plan approved")
+agent.require_writable("keep editing")               # OK, turn 2
+```
+
+The host is responsible for calling `begin_turn()` when a new user message
+arrives — the framework cannot see message boundaries by itself. `resume()`
+already includes one `begin_turn`; do not call it twice for the same message.
 
 ## Quickstart
 

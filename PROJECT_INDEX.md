@@ -1,6 +1,6 @@
 # PROJECT_INDEX
 
-> 最后更新：2026-11-18（v0.4.1 发布收尾：lint 与测试口径）
+> 最后更新：2026-11-19（v0.4 演示资产与 README 主视觉刷新）
 > 维护规则：每次代码修改后追加「修改历史」，并刷新此处。
 
 ## 1. 项目基本信息
@@ -311,6 +311,20 @@ env = PYTHONIOENCODING=utf-8, PYTHONUTF8=1
   `RELEASE_NOTES_v0.4.0.md`、`PROJECT_INDEX.md` 已同步
 - 新增 `RELEASE_NOTES_v0.4.1.md`；版本号 `0.4.1`
 - 备份：`.backups/20261118_v4.1/`；问题记录：`BUG_DESCRIPTION.md`
+
+### 2026-11-19 · v0.4 演示资产与 README 主视觉刷新
+
+- 重制 `docs/social-preview.png`：版本徽章从 v0.3.0 更新为 v0.4.1，
+  特性列表加入「CAS-committed checkpoints」，测试口径改为 107，终端卡片
+  展示 `state CAS → journal → archive` 与 `commit_seq 3 · journal cleared`
+- 重制 `docs/demo.gif`：标题栏与页脚更新为 v0.4.1，演示流程改为
+  `state CAS → journal → archive → pending cleared`，不再展示 v0.3 的
+  “save memory first”
+- `README.md` 标题改为 v4，v4 提交协议移到写租约之前，测试徽章改为
+  107 collected，demo 说明同步
+- `README.zh-CN.md` 补充 state 唯一提交点 / journal，演示说明同步
+- `cli.py` demo 在断点后输出 `commit_seq` / `checkpoint_key` /
+  `archive_pending` / journal 状态，便于直接观察 v4 提交结果
 
 ## 8. 技术债务
 
