@@ -200,8 +200,8 @@ class InMemoryBackend:
 
     def read_raw(self, record_id: str, max_chars: int = 0) -> dict[str, Any]:
         self.calls.append(("read_raw", record_id))
-        if record_id not in self.entities:
-            raise MemoryBackendError(f"记录不存在：{record_id}")
+        if record_id not in self.entities or record_id not in self.raw:
+            raise MemoryBackendError(f"记录原文不存在：{record_id}")
         text = self.raw[record_id]
         truncated = bool(max_chars and 0 < max_chars < len(text))
         return {

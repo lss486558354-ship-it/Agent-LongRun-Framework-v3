@@ -25,9 +25,10 @@
 项目根决定两处数据：
 
 ```text
-<项目根>/.longrun/state.json     热状态
-<项目根>/memory.db              冷记忆索引
-<项目根>/raw_data/<id>/raw.txt  冷记忆原文
+<项目根>/.longrun/state.json             热状态（唯一权威）
+<项目根>/.longrun/checkpoint_journal.json 待归档凭证（post-commit）
+<项目根>/memory.db                      冷记忆索引
+<项目根>/raw_data/<id>/raw.txt          冷记忆原文
 ```
 
 ## 禁止

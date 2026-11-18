@@ -38,7 +38,7 @@ python examples/01_interrupted_task.py --mcp
 2. `start_task` 自动检索并加载原文
 3. 只读门禁拦截写操作
 4. `enable_writes` 解锁
-5. token 预警 → `checkpoint`（先写记忆，再输出断点）
+5. token 预警 → `checkpoint`（state CAS → journal → 归档 → 才输出断点）
 6. 新 `LongRunAgent(root=同一个临时目录)` 读取本地状态并 `resume`
 7. `finish` 写入完成归档
 

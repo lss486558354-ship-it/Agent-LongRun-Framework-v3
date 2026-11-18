@@ -7,15 +7,17 @@ Agent 在本仓库工作，或使用本框架执行任务时，必须遵守以�
 技能：`skills/auto-dev-workflow/SKILL.md`
 架构：`README.md`
 
-## 项目边界（v0.3）
+## 项目边界（v0.4）
 
 - 每个任务绑定一个**项目根**：`LongRunAgent(root=项目根)`
 - 热状态：`<项目根>/.longrun/state.json`
+- 待归档凭证：`<项目根>/.longrun/checkpoint_journal.json`（单槽）
 - 冷记忆：`<项目根>/memory.db` 与 `<项目根>/raw_data/`
 - MCP 子进程必须由 `MCPMemoryBackend(project_path=项目根)` 启动，
   参数带 `--project_path <项目根>`
 - 一个任务只读写本项目记忆；需要跨项目时显式切换 `root`，不要混用两个库
 - 默认后端与 `StateStore` 的项目根必须一致，否则 `resume()` 会读错历史
+- state 是权威；memory 是归档。恢复顺序固定为 `state → journal → memory`
 
 ## 两条铁律
 
@@ -25,7 +27,11 @@ Agent 在本仓库工作，或使用本框架执行任务时，必须遵守以�
 
 ### 铁律二
 
-**在完成一个执行阶段或触发中断（如 token 预警）时，必须先调用 `save_memory` 存入当前进度和关键决策，然后再输出断点信息。**
+**在完成一个执行阶段或触发中断（如 token 预警）时，必须先完成 state 提交与
+`save_memory` 归档，归档成功后才输出断点信息。**
+
+v4 的 `checkpoint()` 已封装这个顺序：CAS 前不写记忆，CAS 后写 journal、
+再写 memory。归档失败会抛 `CheckpointArchiveError`，不返回断点文本。
 
 ## 执行顺序（不可调换）
 
@@ -38,12 +44,24 @@ start_task
   → 实施
   → checkpoint / complete_phase
       → 收回写租约
-      → 生成断点（含机器标记）
+      → 生成断点 + archive_pending=True
+      → state CAS（唯一提交点）
+      → 写 checkpoint_journal.json
       → save_memory（铁律二）
-      → 成功后才更新状态、输出断点
+      → archive 成功后才清 pending、删 journal、输出断点
   → 下一条用户消息：begin_turn()（收回上一轮权限）
-  → resume：search_memory → 校验状态 → read_raw_data → read_only → 重新授权
+  → resume：state → journal → memory 修复 pending → read_only → 重新授权
 ```
+
+- CAS 失败：不写 memory、不写 journal、不输出断点，抛 `StateConflict`
+- CAS 成功但 archive 失败：state 保持 `archive_pending=True`，
+  抛 `CheckpointArchiveError`；用 `resume()` 或
+  `retry_pending_checkpoint()` 补档
+- pending 时硬停写：`enable_writes` / `require_writable` / `save_decision` /
+  `start_task` / 新 `checkpoint` 全部拒绝；`begin_turn` / `end_turn` /
+  `status` / `disable_writes` 放行
+- v3 `pending_checkpoint.json` 只读兼容：必须显式
+  `retry_legacy_checkpoint()` 或 `clear(force=True)`
 
 ## 读写门禁（单轮写租约）
 
@@ -56,6 +74,10 @@ start_task
 - `begin_turn()` / `end_turn()` / `checkpoint()` / `resume()` /
   `recover_from_memory()` 都会收回写权限
 - 写操作前必须 `require_writable(动作)`；过期租约直接拒绝
+- stale lease 被拒绝时，框架会先把 `read_only` 落盘，再抛
+  `WriteGateViolation`
+- `archive_pending=True` 时硬停写，直到补档完成
+- `status()` 读磁盘，不返回缓存；门禁与查询看到同一份权威状态
 - 不允许绕过门禁直接调用 Write/Edit
 - 宿主必须在每条新用户消息开始时调用 `begin_turn()`；
   `resume()` 已自带一次，不要重复调用
@@ -76,6 +98,7 @@ start_task
 | 查记忆 | `search_memory` | `agent.start_task()` / `_safe_search` |
 | 读原文 | `read_raw_data` | `agent.resume()` / `recover_from_memory()` |
 | 写断点/决策 | `save_memory` | `agent.checkpoint()` / `complete_phase()` / `finish()` / `save_decision()` |
+| 补归档 | `save_memory` | `agent.retry_pending_checkpoint()` / `retry_legacy_checkpoint()` |
 | 建关系 | `link_memory` | `save_decision(relates_to=...)` |
 
 ## 本仓库开发约定
@@ -92,6 +115,8 @@ start_task
 
 - 未检索记忆就下「无历史方案」结论
 - 先输出断点再补写记忆
+- 在 CAS 之前调用 `save_memory`（会产生 orphan 断点）
+- archive/pending 未清时继续写文件、写新断点或写决策
 - 只读模式下写文件
 - 把一次 `enable_writes()` 当成持久开关，跨轮次继续写
 - 把 A 项目的状态与 B 项目的记忆混在一起

@@ -2,7 +2,7 @@
 
 这里守的是三条顺序约束：
 1. start_task 先查记忆
-2. checkpoint 先写记忆，再返回断点
+2. checkpoint 先提交 state（CAS），再归档，最后才返回断点
 3. 只读模式不能做写操作
 
 外加断点恢复：本地状态丢失后，必须能从记忆库重建。
@@ -164,7 +164,7 @@ def test_start_task_rejects_any_access_mode_argument(agent) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 约束 2：先写记忆再输出断点
+# 约束 2：先提交 state，再归档，最后输出断点
 # ---------------------------------------------------------------------------
 
 
@@ -174,10 +174,13 @@ def test_checkpoint_saves_before_returning(agent, memory) -> None:
 
     checkpoint = agent.checkpoint(reason="token 预警", next_step="接入第二个平台")
 
-    assert [call[0] for call in memory.calls] == ["save"]
+    # v4：CAS 提交后先按 checkpoint_key 查重，再归档；返回前最后一个动作
+    # 必须是 save。
+    assert memory.calls[-1][0] == "save"
     assert checkpoint.state.checkpoint_id == checkpoint.memory_id
     stored = memory.entities[checkpoint.memory_id]
     assert "[断点]" in stored["title"]
+    assert checkpoint.checkpoint_key in stored["keywords"]
 
 
 def test_checkpoint_pauses_and_persists(agent, tmp_path) -> None:
@@ -223,11 +226,15 @@ def test_checkpoint_write_failure_blocks_output(agent, memory, tmp_path) -> None
     with pytest.raises(CheckpointWriteError, match="断点未输出"):
         agent.checkpoint(reason="token 预警", next_step="继续")
 
-    # 状态没有被推进，断点文本也没有返回；写权限同样被收回
-    assert agent.status()["status"] == "in_progress"
-    assert agent.status()["checkpoint_id"] is None
-    assert agent.status()["access_mode"] == "read_only"
-    assert (tmp_path / ".longrun" / "pending_checkpoint.json").exists()
+    # v4：CAS 已提交，所以状态进入 paused 并留下 archive_pending；
+    # 断点文本没有返回，写权限已收回，journal 是补档凭证。
+    status = agent.status()
+    assert status["status"] == "paused"
+    assert status["archive_pending"] is True
+    assert status["checkpoint_id"] is None
+    assert status["access_mode"] == "read_only"
+    assert (tmp_path / ".longrun" / "checkpoint_journal.json").exists()
+    assert not (tmp_path / ".longrun" / "pending_checkpoint.json").exists()
 
 
 def test_checkpoint_rejects_unknown_kind(agent) -> None:

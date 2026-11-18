@@ -88,6 +88,10 @@ TERMINAL_STATUSES = frozenset({TaskStatus.COMPLETED, TaskStatus.FAILED})
 # 历史只保留最近 N 条，避免 state.json 无限增长。
 MAX_HISTORY = 20
 
+# v4 状态 schema。缺失 schema_version 的旧状态按 0 处理；
+# 高于这个版本的 state 明确拒绝，避免新字段被旧代码静默丢掉。
+STATE_SCHEMA_VERSION = 4
+
 
 class StateMachineError(RuntimeError):
     """状态机相关错误的基类。"""
@@ -103,6 +107,10 @@ class StateCorruptError(StateMachineError):
 
 class StateConflict(StateMachineError):
     """状态文件被其他进程修改，当前写入基于过期 revision。"""
+
+
+class StatePendingError(StateMachineError):
+    """状态已提交，但断点归档尚未完成；此时不能清除或覆盖。"""
 
 
 class StateLockTimeout(StateMachineError):
@@ -239,15 +247,28 @@ class TaskState:
     next_step: str = ""
     checkpoint_id: str | None = None
     checkpoint_memory_ids: list[str] = field(default_factory=list)
+    # v4 提交协议字段。checkpoint_key 是权威指针，checkpoint_id 只是
+    # archive 成功后的 memory record id，不能作为恢复资格。
+    schema_version: int = STATE_SCHEMA_VERSION
+    task_epoch: str | None = None
+    checkpoint_key: str | None = None
+    commit_seq: int | None = None
+    archive_pending: bool = False
     created_at: str = field(default_factory=now_iso)
     updated_at: str = field(default_factory=now_iso)
     history: list[dict[str, Any]] = field(default_factory=list)
     # 状态文件版本号：每次成功 save 由 StateStore 递增。
     # 读-改-写路径用它做 CAS，防止多进程互相覆盖。
     revision: int = 0
+    # 未知字段 round-trip：旧/新版本互相打开时，不要静默丢字段。
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._normalize_write_lease()
+        # pending 是硬停写状态：即使构造参数带 writable，也不允许保留租约。
+        if self.archive_pending:
+            self.access_mode = AccessMode.READ_ONLY
+            self.write_lease_turn = None
 
     def _normalize_write_lease(self) -> None:
         """维护写租约不变量：只有 in_progress 且绑定轮次时才允许 writable。
@@ -319,7 +340,7 @@ class TaskState:
 
     def to_dict(self) -> dict[str, Any]:
         """显式转换枚举。直接 asdict() 会留下 Enum 对象，json.dumps 会炸。"""
-        return {
+        payload: dict[str, Any] = {
             "task_id": self.task_id,
             "description": self.description,
             "status": self.status.value,
@@ -332,14 +353,41 @@ class TaskState:
             "next_step": self.next_step,
             "checkpoint_id": self.checkpoint_id,
             "checkpoint_memory_ids": list(self.checkpoint_memory_ids),
+            "schema_version": self.schema_version,
+            "task_epoch": self.task_epoch,
+            "checkpoint_key": self.checkpoint_key,
+            "commit_seq": self.commit_seq,
+            "archive_pending": self.archive_pending,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "revision": self.revision,
             "history": list(self.history),
         }
+        # 已知字段优先；未知字段只在后面没有同名键时写回。
+        for key, value in self.extra.items():
+            payload.setdefault(key, value)
+        return payload
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TaskState:
+        schema_version = int(data.get("schema_version", 0) or 0)
+        if schema_version > STATE_SCHEMA_VERSION:
+            raise StateCorruptError(
+                f"状态 schema_version={schema_version} 高于当前支持的 "
+                f"{STATE_SCHEMA_VERSION}。请升级框架后再打开这个项目，"
+                "不要让旧二进制静默丢掉新字段。"
+            )
+
+        known = {
+            "task_id", "description", "status", "access_mode", "turn_index",
+            "write_lease_turn", "phase", "completed_steps", "decisions",
+            "next_step", "checkpoint_id", "checkpoint_memory_ids",
+            "schema_version", "task_epoch", "checkpoint_key", "commit_seq",
+            "archive_pending", "created_at", "updated_at", "history", "revision",
+        }
+        extra = {key: value for key, value in data.items() if key not in known}
+        commit_seq = data.get("commit_seq")
+
         # `__post_init__` 会归一化非执行状态的写租约，旧 JSON 不能绕过门禁。
         return cls(
             task_id=str(data["task_id"]),
@@ -358,10 +406,20 @@ class TaskState:
             next_step=str(data.get("next_step", "")),
             checkpoint_id=data.get("checkpoint_id"),
             checkpoint_memory_ids=list(data.get("checkpoint_memory_ids") or []),
+            schema_version=schema_version,
+            task_epoch=(
+                str(data["task_epoch"]) if data.get("task_epoch") else None
+            ),
+            checkpoint_key=(
+                str(data["checkpoint_key"]) if data.get("checkpoint_key") else None
+            ),
+            commit_seq=int(commit_seq) if commit_seq is not None else None,
+            archive_pending=bool(data.get("archive_pending", False)),
             created_at=str(data.get("created_at") or now_iso()),
             updated_at=str(data.get("updated_at") or now_iso()),
             history=list(data.get("history") or [])[-MAX_HISTORY:],
             revision=int(data.get("revision", 0) or 0),
+            extra=extra,
         )
 
 
@@ -385,7 +443,11 @@ class StateStore:
         self.root = Path(root).resolve()
         self.dir = self.root / ".longrun"
         self.path = self.dir / "state.json"
-        self.fallback_path = self.dir / "pending_checkpoint.json"
+        # v4 单槽 journal：CAS 成功后、archive 完成前的本地凭证。
+        self.journal_path = self.dir / "checkpoint_journal.json"
+        # v3 兼容：只读检测，v4 不再写这个文件。
+        self.legacy_fallback_path = self.dir / "pending_checkpoint.json"
+        self.fallback_path = self.legacy_fallback_path
         # 锁文件独立于 state.json，且永不删除：删除会让两个进程
         # 各持一个不同 inode 的锁，等于没锁。
         self.lock_path = self.dir / "state.lock"
@@ -431,6 +493,9 @@ class StateStore:
         state: TaskState,
         *,
         expected_revision: int | None = None,
+        expected_task_id: str | None = None,
+        expected_task_epoch: str | None = None,
+        minimum_revision: int | None = None,
     ) -> None:
         """原子保存状态，并递增 revision。
 
@@ -439,6 +504,13 @@ class StateStore:
                 磁盘上的 revision 与它不一致就抛 StateConflict，
                 绝不覆盖其他进程刚写入的进度。传 None 表示不做 CAS
                 （仅用于初始化或明确接受覆盖的场景）。
+            expected_task_id: 可选的 task_id CAS。防止 revision 相同但任务
+                已被替换的 ABA 场景。
+            expected_task_epoch: 可选的 task_epoch CAS。新任务换 epoch 后，
+                旧进程即使 revision 相同也不能写入。
+            minimum_revision: 新 revision 的下限。仅用于从 journal 重建
+                state：不能让 revision 倒退到旧断点之前，否则下一次
+                checkpoint 的 commit_seq 会小于历史断点，破坏恢复排序。
 
         跨进程锁 + 唯一临时文件 + os.replace：
         - 锁保证「读 revision → 比较 → 写」是一个原子临界区；
@@ -448,6 +520,33 @@ class StateStore:
         with self.locked():
             current = self._load_unlocked()
             current_revision = current.revision if current is not None else 0
+
+            if current is None:
+                if expected_task_id is not None or expected_task_epoch is not None:
+                    raise StateConflict(
+                        "状态文件不存在，但调用方期望任务 "
+                        f"task_id={expected_task_id!r} / "
+                        f"task_epoch={expected_task_epoch!r}；请重新加载。"
+                    )
+            else:
+                if (
+                    expected_task_id is not None
+                    and current.task_id != expected_task_id
+                ):
+                    raise StateConflict(
+                        f"任务身份冲突：期望 task_id={expected_task_id!r}，"
+                        f"当前 task_id={current.task_id!r}。"
+                    )
+                if (
+                    expected_task_epoch is not None
+                    and current.task_epoch != expected_task_epoch
+                ):
+                    raise StateConflict(
+                        f"任务世代冲突：期望 task_epoch="
+                        f"{expected_task_epoch!r}，当前 task_epoch="
+                        f"{current.task_epoch!r}。"
+                    )
+
             if (
                 expected_revision is not None
                 and current_revision != expected_revision
@@ -459,29 +558,134 @@ class StateStore:
                 )
 
             new_revision = current_revision + 1
+            if minimum_revision is not None:
+                new_revision = max(new_revision, int(minimum_revision))
             previous_revision = state.revision
+            previous_schema = state.schema_version
             state.revision = new_revision
+            if state.schema_version < STATE_SCHEMA_VERSION:
+                # 旧状态第一次被 v4 保存时升级 schema；未知字段仍在 extra 里。
+                state.schema_version = STATE_SCHEMA_VERSION
             try:
                 self._atomic_write(state)
             except BaseException:
                 # 写失败时不要在内存里留下一个磁盘上不存在的 revision。
                 state.revision = previous_revision
+                state.schema_version = previous_schema
                 raise
 
     def _atomic_write(self, state: TaskState) -> None:
+        self._atomic_write_json(self.path, state.to_dict())
+
+    def _atomic_write_json(self, path: Path, payload: dict[str, Any]) -> None:
+        """唯一 tmp + os.replace 的 JSON 原子写。"""
         self.dir.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(
-            f"{self.path.stem}.{os.getpid()}.{uuid.uuid4().hex}.json.tmp"
+        tmp = path.with_name(
+            f"{path.stem}.{os.getpid()}.{uuid.uuid4().hex}.json.tmp"
         )
         try:
             tmp.write_text(
-                json.dumps(state.to_dict(), ensure_ascii=False, indent=2),
+                json.dumps(payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            os.replace(tmp, self.path)
+            os.replace(tmp, path)
         finally:
             tmp.unlink(missing_ok=True)
 
-    def clear(self) -> None:
+    # -- v4 journal ---------------------------------------------------------
+
+    def load_journal(self) -> dict[str, Any] | None:
+        """读取单槽 journal。损坏时明确报错，不能静默当成没有。"""
         with self.locked():
+            return self._load_journal_unlocked()
+
+    def _load_journal_unlocked(self) -> dict[str, Any] | None:
+        if not self.journal_path.exists():
+            return None
+        try:
+            data = json.loads(self.journal_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise StateCorruptError(
+                f"断点 journal 损坏：{self.journal_path}。"
+                "不要猜，先检查文件或从 archive/state 恢复。"
+            ) from exc
+        if not isinstance(data, dict):
+            raise StateCorruptError(
+                f"断点 journal 结构错误：{self.journal_path} 顶层必须是对象。"
+            )
+        return data
+
+    def write_journal(self, payload: dict[str, Any]) -> Path:
+        """写单槽 journal，返回路径。
+
+        已有 journal 且不属于同一个断点、或 commit_seq 更高时拒绝覆盖；
+        调用方必须先 resume()/retry_pending_checkpoint() 对账。
+        """
+        with self.locked():
+            existing = self._load_journal_unlocked()
+            if existing is not None:
+                old_key = existing.get("checkpoint_key")
+                new_key = payload.get("checkpoint_key")
+                old_seq = existing.get("commit_seq")
+                new_seq = payload.get("commit_seq")
+                if old_key != new_key:
+                    if (
+                        old_seq is not None
+                        and new_seq is not None
+                        and int(old_seq) >= int(new_seq)
+                    ):
+                        raise StateConflict(
+                            "已存在更新的 checkpoint journal "
+                            f"(key={old_key!r}, commit_seq={old_seq!r})；"
+                            "请先 resume() 或 retry_pending_checkpoint() 对账。"
+                        )
+            self._atomic_write_json(self.journal_path, payload)
+            return self.journal_path
+
+    def remove_journal(
+        self,
+        *,
+        expected_task_epoch: str | None = None,
+        expected_commit_seq: int | None = None,
+    ) -> bool:
+        """删除 journal，但只在 epoch/commit_seq 匹配时删除。
+
+        Returns:
+            True 表示删除成功；False 表示 journal 不存在或与期望不匹配。
+        """
+        with self.locked():
+            existing = self._load_journal_unlocked()
+            if existing is None:
+                return False
+            if (
+                expected_task_epoch is not None
+                and existing.get("task_epoch") != expected_task_epoch
+            ):
+                return False
+            if (
+                expected_commit_seq is not None
+                and existing.get("commit_seq") != expected_commit_seq
+            ):
+                return False
+            self.journal_path.unlink(missing_ok=True)
+            return True
+
+    def clear(self, *, force: bool = False) -> None:
+        """清除本地状态。
+
+        pending 时默认拒绝；`force=True` 会同时删除 state、journal 和
+        v3 legacy fallback。只有用户明确接受丢断点时才用 force。
+        """
+        with self.locked():
+            state = self._load_unlocked()
+            if state is not None and state.archive_pending and not force:
+                raise StatePendingError(
+                    f"任务 {state.task_id} 还有待归档断点 "
+                    f"(checkpoint_key={state.checkpoint_key!r})，拒绝 clear()。"
+                    "先 resume()/retry_pending_checkpoint()；"
+                    "确需丢弃请用 clear(force=True)。"
+                )
             self.path.unlink(missing_ok=True)
+            self.journal_path.unlink(missing_ok=True)
+            if force:
+                self.legacy_fallback_path.unlink(missing_ok=True)

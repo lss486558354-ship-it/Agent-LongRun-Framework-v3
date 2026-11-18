@@ -3,7 +3,7 @@
 English | [简体中文](README.zh-CN.md)
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-73%20passed-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-106%20passed-brightgreen)](tests/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![MCP](https://img.shields.io/badge/MCP-stdio-6f42c1)](https://modelcontextprotocol.io)
 
@@ -47,7 +47,7 @@ The core loop:
 
 ```text
 start_task → search memory → work under the state machine
-          → checkpoint: save memory first, print the checkpoint second
+          → checkpoint: state CAS first, archive memory second, print last
           → resume / recover on another process or machine
 ```
 
@@ -82,6 +82,43 @@ The host is responsible for calling `begin_turn()` when a new user message
 arrives — the framework cannot see message boundaries by itself. `resume()`
 already includes one `begin_turn`; do not call it twice for the same message.
 
+## Checkpoint commit protocol (v4)
+
+v3 wrote memory first and then committed state. If the CAS lost, the losing
+writer had already left an orphan checkpoint in memory. v4 makes **the state CAS
+the only commit point**:
+
+```text
+revoke lease → render (archive_pending=True)
+  → state CAS                         ← commit point; no memory write before this
+  → .longrun/checkpoint_journal.json
+  → save_memory (archive)
+  → clear pending + delete journal
+  → return checkpoint text
+```
+
+Properties:
+
+- A CAS loser writes neither memory nor journal, so recovery cannot select it.
+- `archive_pending=true` is committed in the same write as the checkpoint. If
+  the archive fails, `checkpoint()` raises `CheckpointArchiveError` and returns
+  no text. `resume()` / `retry_pending_checkpoint()` repairs it.
+- Recovery authority is `state → journal → memory`, not "newest memory wins".
+- A checkpoint is qualified by `task_epoch + checkpoint_key + commit_seq`;
+  `checkpoint_id` is only a best-effort cache. The full key is stored in the
+  title/keywords because the router only searches those fields.
+- Same task: highest `commit_seq` wins. Different `task_epoch`: ambiguous unless
+  you pass a key or `on_ambiguous="latest"`.
+- Pending is a write hard-stop: `enable_writes`, `require_writable`,
+  `save_decision`, `start_task`, and new `checkpoint` calls are rejected until
+  the archive is repaired. Turn lifecycle and `status()` still work.
+- Legacy v3 state loads, but v3 archives are `unverified` until
+  `allow_legacy=True`. A v3 `pending_checkpoint.json` requires an explicit
+  `retry_legacy_checkpoint()` or `clear(force=True)`.
+
+Durability promise: **process crash**, not power loss. State/journal use unique
+temp files plus `os.replace`; fsync/SQLite `synchronous=FULL` are out of scope.
+
 ## Quickstart
 
 Install the memory router and this framework straight from Git:
@@ -98,7 +135,7 @@ The demo runs the whole loop in a temp directory:
 ```text
 start_task (read-only)
   → enable_writes (unlocks the current turn only)
-  → checkpoint (save memory first, then print the checkpoint)
+  → checkpoint (state CAS → journal → archive → print)
   → new Agent resume (back to read-only, next turn)
   → write attempt rejected: the lease did not survive resume
   → enable_writes again
@@ -119,7 +156,7 @@ cd Agent-LongRun-Framework-v3
 python -m pip install -e ".[dev]"
 python -m pip install -e ../agent-memory-router-v2
 
-python -m pytest tests/ -q                    # 73 passed, 1 skipped
+python -m pytest tests/ -q                    # 106 passed, 1 skipped
 python examples/01_interrupted_task.py        # in-process backend
 python examples/01_interrupted_task.py --mcp  # real MCP stdio
 ```
@@ -145,14 +182,17 @@ flowchart LR
     C -->|no| X
     C -->|yes| P["checkpoint<br/>render + machine marker"]
 
+    P -->|commit point<br/>archive_pending=true| L[("<root>/.longrun/<br/>state.json")]
+    P -->|post-commit credential| J[".longrun/<br/>checkpoint_journal.json"]
     P -->|invariant 2<br/>save_memory| M
-    M -->|ok: memory_id| O[print checkpoint]
-    M -->|fail| F["write pending_checkpoint.json<br/>print nothing"]
+    M -->|ok| O[clear pending<br/>print checkpoint]
+    M -->|fail| F["keep pending<br/>CheckpointArchiveError<br/>print nothing"]
 
-    O --> R[resume / recover_from_memory]
-    R --> S
+    O --> R[resume / retry_pending_checkpoint]
+    F --> R
+    J --> R
+    R -->|state → journal → memory| S
 
-    S -.state on disk.-> L[("<root>/.longrun/<br/>state.json")]
     R -.local state lost.-> M
 ```
 
@@ -191,10 +231,10 @@ states have no exits.
 
 1. **Memory before execution.** `start_task()` calls `search()` before it creates
    state. No memory lookup, no task.
-2. **Memory before checkpoint output.** `checkpoint()` calls `save()` before it
-   returns text. If the save fails, it writes `.longrun/pending_checkpoint.json`
-   and raises `CheckpointWriteError` — it never prints a checkpoint that was not
-   persisted.
+2. **CAS before archive, archive before output.** `checkpoint()` commits state
+   first, then writes memory. It returns text only after the archive succeeds;
+   on failure it raises `CheckpointArchiveError` and leaves the committed state
+   `archive_pending`. CAS losers never write memory.
 3. **Write permission expires.** One approval covers one turn. Checkpointing,
    resuming, recovering, and ending a turn all revoke it.
 4. **One project, one root.** State and memory share the same `root`; unfinished
@@ -216,7 +256,7 @@ print(started.context)    # on-demand raw text (top 1 by default)
 agent.enable_writes("read the old plan, moving to implementation")
 agent.require_writable("edit adapters/xometry.py")
 
-# 3. Interrupt: memory first, checkpoint second
+# 3. Interrupt: state CAS, journal, archive, then output
 checkpoint = agent.checkpoint(
     reason="token budget warning",
     summary="Xometry read-only prober is done",
@@ -294,9 +334,10 @@ A checkpoint restores *this project's* progress. If state lives in A and memory
 in B, `resume()` will take A's `next_step` and look it up in B's history, with no
 way to tell which side is right.
 
-**Why save memory before printing a checkpoint?**
-The printed checkpoint is a receipt. Reverse the order and a killed process
-leaves the chat log as the only copy — the least durable store in the system.
+**Why CAS first, then archive, then print?**
+The state CAS is the single commit point. Writing memory first means a failed
+CAS leaves an orphan record; printing first means a failed write leaves the chat
+log as the only copy. Both are excluded by the fixed order.
 
 **Why a JSON marker inside the checkpoint?**
 Recovering from prose forces the model to guess status. The marker lets
@@ -304,9 +345,10 @@ Recovering from prose forces the model to guess status. The marker lets
 exactly.
 
 **Why both local state and memory?**
-`.longrun/state.json` is the hot path: fast and atomic. Memory is the cold
-backup: cross-machine, cross-session. On conflict, the checkpoint in memory wins
-because it passed through a user-visible output path.
+`.longrun/state.json` is the hot path: fast and atomic, and the authority for
+recovery. Memory is the cold backup: cross-machine, cross-session. Recovery
+reads `state → journal → memory`; "newest memory wins" is deliberately not a
+rule, because a committed state can be newer than its archived copy.
 
 **Why read-only by default?**
 The most common damage during research is editing before the design is settled.
@@ -349,58 +391,24 @@ to be embedded, not to own your runtime.
 - The API is synchronous; wrap it in a thread pool for async hosts.
 - Windows consoles need `PYTHONIOENCODING=utf-8`; examples reconfigure stdout.
 
-## Security & white-hat challenge
+## Security: previously published targets
 
-V3 has fixed the P0 write-gate and state-file concurrency issues (single-turn
-lease, cross-process `state.lock`, unique temp file, `revision/CAS`). We are
-now publishing two deeper, agent-native targets for white-hat review. These are
-design-level challenges, not a claim that the current code is safe. Please send
-a minimal PoC privately first; do not open a public issue with a working exploit.
+V0.3 published two agent-native white-hat targets. V0.4 closes both:
 
-### Target 1 — checkpoint marker injection (bounty)
+- **Marker injection.** `checkpoint()` escapes `<!--` / `-->` in user-visible
+  text and in the serialized marker JSON. `_parse_state_marker()` accepts only
+  exactly one marker; multiple markers are not trusted. Regression tests:
+  `tests/test_v4_recovery.py::test_marker_injection_is_ignored`.
+- **Orphan checkpoint after a failed CAS.** The state CAS is now the only commit
+  point, and memory is written after it. A CAS loser writes neither memory nor
+  journal. Regression test:
+  `tests/test_target2_orphan_checkpoint.py::test_cas_conflict_writes_no_archive_and_recovery_uses_committed_checkpoint`.
 
-**Invariant.** A checkpoint record must contain exactly one trusted machine
-marker. `recover_from_memory()` must restore the real task or fail; it must
-never adopt an attacker-chosen marker.
-
-**Challenge.** Using only the public API, craft input in `task_desc`, `phase`,
-`summary`, `next_step`, or `decisions` so that after local state is lost,
-`recover_from_memory()` returns an attacker-chosen `task_id` or `next_step`.
-Relevant code: `workflow_manager._render_checkpoint()`,
-`workflow_manager._STATE_MARKER_RE`, `LongRunAgent.recover_from_memory()`.
-
-**Acceptance.** A minimal PoC plus a pytest that fails on the current code and
-passes after the fix. A concrete fix proposal is welcome.
-
-### Target 2 — orphan checkpoint after a failed CAS (challenge)
-
-**Invariant.** A checkpoint memory that did not pass the state CAS must never
-be treated as a valid checkpoint during recovery.
-
-**Scenario.** Two agents checkpoint concurrently. One wins the CAS; the other
-fails, but the loser's session record is already in the memory store. Show a
-reproducible timing in which `recover_from_memory()` selects the failed record,
-or prove why it cannot. Relevant code: `LongRunAgent.checkpoint()` (CAS commit)
-and `LongRunAgent.recover_from_memory()` (candidate selection).
-
-**Acceptance.** A minimal concurrent timeline plus a repeatable failing test.
-A commit-proof / idempotency-key design is a bonus.
-
-### Rewards and reporting
-
-- Reward is negotiated per submission (cash, project credit, or both); we will
-  confirm the amount in the private channel before you invest in a full writeup.
-- Report via GitHub Security Advisories / private vulnerability reporting.
-  Do not publish a full PoC before a fix is available.
-- We aim to acknowledge within 72 hours and coordinate disclosure within
-  90 days. Credit is given publicly after disclosure.
-
-### Scope note
-
+If you find a v0.4 bypass, report it via GitHub Security Advisories / private
+vulnerability reporting. Do not publish a working PoC before a fix is available.
 A same-host, same-user process that can replace `.longrun/state.lock` or edit
-`.longrun/state.json` directly is outside the application-level threat model.
-We will harden that path with inode checks, `O_NOFOLLOW`, epochs, and deployment
-isolation, but it is not one of the bounty targets.
+`.longrun/state.json` directly remains outside the application-level threat
+model.
 
 ## Tests
 
@@ -412,7 +420,13 @@ The suite covers, among others:
 
 - illegal transitions fail, terminal states have no exits
 - `start_task`'s first backend call is `search`
-- `checkpoint`'s first backend call is `save`; failure returns no checkpoint
+- `checkpoint` returns only after the final backend call is `save`; a CAS loser
+  writes no memory and no journal
+- a post-CAS archive failure leaves `archive_pending=true` and returns no text;
+  resume / retry repairs it from archive, journal, or a re-rendered fallback
+- recovery follows `state → journal → memory`; active tasks are protected,
+  terminal candidates are skipped, and same-task candidates pick the highest
+  `commit_seq`
 - read-only mode blocks writes; `enable_writes` allows them
 - the lease expires on `begin_turn` / `end_turn` / `checkpoint` / `resume` /
   `recover_from_memory`

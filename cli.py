@@ -1,4 +1,4 @@
-"""Command line entry point for Agent-LongRun-Framework v3.
+"""Command line entry point for Agent-LongRun-Framework v4.
 
     agent-longrun demo
 
@@ -50,7 +50,7 @@ def run_demo() -> int:
     agent.require_writable("demo write")
     print("write allowed for the current turn")
 
-    print("\n[3] checkpoint: save memory before emitting the resume token")
+    print("\n[3] checkpoint: commit state, archive, then emit the resume token")
     checkpoint = agent.checkpoint(
         reason="token budget",
         summary="read-only probe done",

@@ -7,7 +7,7 @@ name: Bug report
       id: version
       attributes:
         label: Version / commit
-        placeholder: v0.3.0 or commit hash
+        placeholder: v0.4.0 or commit hash
       validations:
         required: true
 

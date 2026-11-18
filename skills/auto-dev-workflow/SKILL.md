@@ -1,6 +1,6 @@
 ---
 name: auto-dev-workflow
-description: 长任务自动开发工作流。任务开始先查记忆，执行受读写门禁约束，中断或阶段完成时先写记忆再输出断点。包含 interrupted-task-recovery（中断恢复）与 phase-completion-archive（阶段归档）两个 SOP。
+description: 长任务自动开发工作流。任务开始先查记忆，执行受读写门禁约束，中断或阶段完成时先提交状态并归档记忆，再输出断点。包含 interrupted-task-recovery（中断恢复）与 phase-completion-archive（阶段归档）两个 SOP。
 ---
 
 # auto-dev-workflow
@@ -81,7 +81,9 @@ LongRunAgent(root=项目根)
 | 状态与记忆不在同一项目 | 停止恢复，核对 `root`；不要跨项目拼进度 |
 | 状态文件损坏 | 不静默重建；先报 `StateCorruptError`，再尝试从记忆恢复 |
 | 记忆里也找不到 | 如实说明，按新任务 `start_task`，不要假装恢复 |
-| `.longrun/pending_checkpoint.json` 存在 | 上次断点未写入记忆，先补写 `save_memory` 再继续 |
+| `state.archive_pending=True` | 上次 CAS 已提交但归档未完成：`resume()` 或 `retry_pending_checkpoint()` 补档，pending 期间不写文件 |
+| `.longrun/checkpoint_journal.json` 存在 | post-commit 凭证：交给 `resume()` 处理；不要手工删除 |
+| `.longrun/pending_checkpoint.json` 存在（v3） | 旧版 fallback：`retry_legacy_checkpoint()` 显式补档，或 `clear(force=True)` 明确丢弃 |
 | 断点里的下一步已过时 | 停下来向用户确认，不要自行改道 |
 
 ---
@@ -96,7 +98,7 @@ LongRunAgent(root=项目根)
    - 有可验证结果（测试通过、命令输出、文件变更）
    - 「基本完成」「应该可以」不算完成，继续做或标记 `blocked`
 
-2. **结构化写记忆**（先写，后汇报）
+2. **先提交状态，再归档记忆**（CAS → journal → save → 清 pending）
 
    ```python
    agent.complete_phase(
@@ -107,20 +109,32 @@ LongRunAgent(root=项目根)
    )
    ```
 
-   等价的手工 MCP 调用：
+   `complete_phase()` 内部顺序固定：
+
+   ```text
+   state CAS（写入 archive_pending=True）   ← 唯一提交点
+     → .longrun/checkpoint_journal.json
+     → save_memory（title/keywords 含完整 checkpoint_key）
+     → 清 archive_pending、记 checkpoint_id、删 journal
+     → 返回断点
+   ```
+
+   等价的手工 MCP 调用必须保持同样顺序：先确认 state 已提交且
+   `archive_pending=True`，再 `save_memory`；归档成功后清 pending 才算完成。
 
    ```text
    save_memory(
      type="session",
-     title="[阶段完成] 阶段2：接入 Xometry —— <一句话>",
+     title="[阶段完成] 阶段2：接入 Xometry —— <一句话> [<checkpoint_key前8位>]",
      content="<阶段 / 已完成 / 关键决策 / 下一步 / 机器标记>",
-     keywords="longrun,checkpoint,<task_id>"
+     keywords="longrun,checkpoint,<task_id>,<task_epoch>,<checkpoint_key>"
    )
    ```
 
-3. **写入成功后**才向用户汇报阶段结果
+3. **归档成功后**才向用户汇报阶段结果
    - 汇报内容与记忆内容必须一致
-   - 附上 memory_id，便于追溯
+   - 附上记忆 id，便于追溯（id 只是缓存，权威指针是
+     `task_epoch + checkpoint_key + commit_seq`）
 
 4. **清理阶段上下文**
    - 只保留下一阶段需要的摘要与决策
@@ -147,14 +161,19 @@ LongRunAgent(root=项目根)
 
 下一步: <具体到可执行>
 
-<!-- longrun-state: {"task_id":"...","status":"in_progress",...} -->
+<!-- longrun-state: {"task_id":"...","schema_version":4,"task_epoch":"...","checkpoint_key":"...","commit_seq":2,"status":"in_progress",...} -->
 ```
+
+marker 必须恰好一个；`checkpoint_id` 不进入 marker，恢复资格看
+`task_epoch + checkpoint_key + commit_seq`。
 
 ### 失败分支
 
 | 情况 | 处理 |
 |------|------|
-| `save_memory` 失败 | 不汇报「已归档」；写 `pending_checkpoint.json`；说明失败原因 |
+| state CAS 失败 | 抛 `StateConflict`；不写记忆、不写 journal、不输出断点；先 `resume()` 对齐 |
+| CAS 后 `save_memory` 失败 | 保持 `archive_pending=True`；不输出断点；说明失败原因；`retry_pending_checkpoint()` 补档 |
+| 归档成功但清 pending 失败 | 断点可输出，但 `archive_pending` 仍为 True；`resume()` 会按 `checkpoint_key` 清掉 |
 | 阶段完成但未验证 | 不要调用 `complete_phase`，标 `waiting_verification` |
 | 决策依赖用户拍板 | 先 `note_blocked()`，等确认后再归档 |
 
@@ -163,6 +182,8 @@ LongRunAgent(root=项目根)
 ## 反模式
 
 - ❌ 先输出断点，再 `save_memory`
+- ❌ 在 state CAS 之前写 memory（CAS 失败会留下 orphan 断点）
+- ❌ 归档失败仍输出断点，或 pending 未清就继续写文件
 - ❌ 只写「继续做」，没写下一步和已完成
 - ❌ 恢复时跳过状态校验，直接按聊天记忆干活
 - ❌ 只读模式下改文件
@@ -181,7 +202,9 @@ LongRunAgent(root=项目根)
 - [ ] `enable_writes()` 只在 `in_progress` 且原因非空时调用
 - [ ] 写操作前调用过 `require_writable`
 - [ ] 写权限只在当前轮有效；断点/恢复/换轮后重新 `enable_writes`
-- [ ] 每个断点都有 memory_id
-- [ ] 断点含单行机器标记
+- [ ] `checkpoint()` 返回前 archive 已成功，`archive_pending` 已清
+- [ ] 每个断点都有可检索的完整 `checkpoint_key`；memory id 仅用于追溯
+- [ ] 断点含恰好一个单行机器标记
+- [ ] 恢复走 `state → journal → memory`，pending 已修复
 - [ ] 恢复时校验过状态机状态
 - [ ] 阶段汇报与记忆内容一致

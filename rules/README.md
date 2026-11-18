@@ -6,7 +6,7 @@
 |------|-----------|
 | `00-entry.md` | 什么时候算长任务 |
 | `01-memory-first.md` | 动手前必须查记忆 |
-| `02-checkpoint-archive.md` | 中断时必须先写记忆再输出断点 |
+| `02-checkpoint-archive.md` | 中断时必须先提交状态并归档记忆，再输出断点 |
 | `03-execution-boundary.md` | 状态机与读写门禁 |
 
 ## 用法

@@ -4,6 +4,79 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-11-18
+
+### Added
+
+- **Checkpoint commit protocol.** The state CAS is now the only commit point.
+  `archive_pending=true` is written in the same CAS, and memory is written only
+  after it. A CAS loser writes neither memory nor journal.
+- **Post-commit journal.** `.longrun/checkpoint_journal.json` (single slot,
+  unique temp file, `os.replace`) records the committed checkpoint until the
+  archive is confirmed. `resume()` uses it to repair a pending checkpoint.
+- `TaskState` fields `schema_version`, `task_epoch`, `checkpoint_key`,
+  `commit_seq`, `archive_pending`, and `extra` (unknown-field round-trip).
+- `retry_pending_checkpoint()` for archive-only repair and
+  `retry_legacy_checkpoint()` for an explicit v3 `pending_checkpoint.json`
+  migration.
+- `StateStore.save()` gains `expected_task_id`, `expected_task_epoch`, and
+  `minimum_revision`; journal removal is guarded by `task_epoch + commit_seq`.
+- New errors: `CheckpointArchiveError`, `PendingArchiveError`,
+  `StatePendingError`, `ArchivePayloadMissing`, `AmbiguousRecovery`,
+  `ActiveTaskExists`, `StateBehindJournal`, `LegacyPendingCheckpoint`.
+- `tests/test_v4_protocol.py` and `tests/test_v4_recovery.py` (106 tests total,
+  1 skipped).
+
+### Changed
+
+- `checkpoint()` / `complete_phase()` / `finish()`: revoke lease → render →
+  state CAS → journal → archive → clear pending → return text. Archive failure
+  raises `CheckpointArchiveError` and returns no checkpoint text.
+- `resume()` uses `state → journal → memory`, repairs `archive_pending`, keeps
+  journal payloads when `state.json` is lost, and never lets `revision` move
+  backwards (`minimum_revision`). It also falls back to `checkpoint_key` when a
+  cached `checkpoint_id` no longer resolves.
+- `recover_from_memory()` validates candidates: active-task protection,
+  terminal skipping, highest `commit_seq` for the same task, ambiguity across
+  `task_epoch`, and `allow_legacy=True` for v3 markers.
+- `require_writable()` persists the revoked lease before raising
+  `WriteGateViolation`; `status()` reads disk instead of the in-memory cache.
+- Pending is a write hard-stop. `enable_writes`, `require_writable`,
+  `save_decision`, `start_task`, and new checkpoints are rejected;
+  `begin_turn`, `end_turn`, `status`, and `disable_writes` still work.
+- `InMemoryBackend.read_raw()` raises `MemoryBackendError` instead of
+  `KeyError` when the raw payload is missing.
+- Rules, `.cursorrules`, the agent skill, README, and project index updated to
+  the v0.4 protocol; package version bumped to `0.4.0`.
+
+### Fixed
+
+- **Orphan checkpoint after a lost CAS** (published v0.3 target): memory is no
+  longer written before the state commit.
+- **Marker injection** (published v0.3 target): user text is escaped, marker
+  JSON escapes `<!--` / `-->`, and only exactly one marker is trusted.
+- A committed checkpoint can no longer be lost when the process dies between
+  CAS, journal, and archive.
+- A stale journal belonging to another task or epoch is no longer silently
+  deleted.
+- An archive record without an `id` no longer raises `KeyError`; the checkpoint
+  stays pending and fails closed.
+
+### Compatibility
+
+- v3 state files load; missing `task_epoch` / `checkpoint_key` / `commit_seq`
+  are populated on the next v4 checkpoint. Future `schema_version` values are
+  rejected.
+- v3 archives without the new fields are `unverified` and require
+  `allow_legacy=True` to participate in recovery.
+- A v3 `.longrun/pending_checkpoint.json` is never migrated silently.
+
+### Durability
+
+- Promised level: **process crash**. State and journal use unique temp files
+  plus `os.replace`. Power-loss durability (fsync, SQLite
+  `synchronous=FULL`) is out of scope for v0.4.
+
 ## [0.3.0] - 2026-11-04
 
 ### Added

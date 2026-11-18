@@ -1,10 +1,10 @@
-# Agent-LongRun-Framework v3
+# Agent-LongRun-Framework v4
 
 [English](README.md) | 简体中文
 
 把「Agent 执行状态机」和「MCP 记忆路由」耦合成一条可中断、可恢复、可审计的长任务流水线。
 
-任务开始先查记忆 → 执行受状态机与单轮写租约约束 → 中断/阶段完成时先写记忆，再输出断点。
+任务开始先查记忆 → 执行受状态机与单轮写租约约束 → 中断/阶段完成时先提交 state、再归档记忆、最后输出断点。
 
 > **配套记忆路由器：** [`agent-memory-router-v2`](https://github.com/lss486558354-ship-it/agent-memory-router-v2)
 > —— 每个项目独立的 SQLite 记忆库 + 原文目录，本框架默认用它作为记忆后端。
@@ -25,6 +25,10 @@
 >
 > v2 起，状态与记忆都绑定到**当前项目根目录**：`<项目>/.longrun/` + `<项目>/memory.db`，
 > 不同项目互不串味。
+>
+> v4 起，断点采用明确的提交协议：**state CAS 是唯一提交点**，
+> 之后才写 journal 与记忆归档；CAS 失败方不会留下 orphan 断点，
+> 归档失败则不输出断点。恢复顺序固定为 `state → journal → memory`。
 
 ![agent-longrun demo](docs/demo.gif)
 
@@ -55,20 +59,23 @@ flowchart LR
     C -->|否| X
     C -->|是| P[checkpoint<br/>生成断点 + 机器标记]
 
+    P -->|唯一提交点<br/>archive_pending=true| L[("<项目根>/.longrun/<br/>state.json")]
+    P -->|提交后凭证| J[".longrun/<br/>checkpoint_journal.json"]
     P -->|铁律二<br/>save_memory| M
-    M -->|成功，返回 memory_id| O[输出断点文本]
-    M -->|失败| F[写 pending_checkpoint.json<br/>不输出断点]
+    M -->|成功| O[清 pending<br/>输出断点文本]
+    M -->|失败| F[保持 pending<br/>CheckpointArchiveError<br/>不输出断点]
 
-    O --> R[resume / recover_from_memory]
-    R --> S
+    O --> R[resume / retry_pending_checkpoint]
+    F --> R
+    J --> R
+    R -->|state → journal → memory| S
 
-    S -.状态落盘.-> L[("<项目根>/.longrun/<br/>state.json")]
     R -.本地状态丢失时.-> M
 ```
 
 `LongRunAgent(root=...)` 同时决定两件事：
 
-- 热状态写到 `<root>/.longrun/`
+- 热状态写到 `<root>/.longrun/`（state + 单槽 journal）
 - 默认 `MCPMemoryBackend` 以 `--project_path <root>` 启动，记忆写到 `<root>/memory.db`
 
 因此 `resume()` 读到的状态和记忆永远属于同一个项目。
@@ -113,17 +120,23 @@ sequenceDiagram
     LRA->>State: read_only → writable
 
     Agent->>LRA: checkpoint(reason, next_step, decisions)
-    LRA->>LRA: 渲染断点 + <!-- longrun-state -->
+    LRA->>LRA: 收回租约 + 渲染断点 + <!-- longrun-state -->
+    LRA->>State: in_progress → paused（archive_pending=true）← 提交点
+    LRA->>LRA: 写 .longrun/checkpoint_journal.json
     LRA->>Mem: save_memory(type=session)
-    alt 写入成功
+    alt 归档成功
         Mem-->>LRA: S_xxxx
-        LRA->>State: in_progress → paused
+        LRA->>State: archive_pending=false + checkpoint_id
+        LRA->>LRA: 删除 journal
         LRA-->>Agent: 断点文本
-    else 写入失败
-        LRA->>LRA: 写 .longrun/pending_checkpoint.json
-        LRA-->>Agent: CheckpointWriteError（不输出断点）
+    else 归档失败
+        LRA-->>Agent: CheckpointArchiveError（保持 pending，不输出断点）
     end
 ```
+
+CAS 失败时不会走到 `save_memory`，所以失败方不会留下 orphan 断点。
+恢复时由 `resume()` / `retry_pending_checkpoint()` 按
+`archive → journal → 按 state 降级重渲染` 的顺序补档。
 
 ## 快速开始
 
@@ -141,7 +154,7 @@ agent-longrun demo
 ```text
 start_task（只读）
   → enable_writes（只解锁当前轮）
-  → checkpoint（先写记忆，再输出断点）
+  → checkpoint（state CAS → journal → 归档 → 输出）
   → 新 Agent resume（回到只读）
   → 重新 enable_writes
   → finish
@@ -160,7 +173,7 @@ cd Agent-LongRun-Framework-v3
 python -m pip install -e ".[dev]"
 python -m pip install -e ../agent-memory-router-v2
 
-python -m pytest tests/ -q                    # 73 passed, 1 skipped
+python -m pytest tests/ -q                    # 106 passed, 1 skipped
 python examples/01_interrupted_task.py        # 本地后端
 python examples/01_interrupted_task.py --mcp  # 真实 MCP stdio
 ```
@@ -236,7 +249,7 @@ print(started.context)                  # 自动加载的原文（默认 1 条�
 agent.enable_writes("已读完历史方案，进入实施")
 agent.require_writable("修改 adapters/xometry.py")
 
-# 3. 中断：先写记忆，成功后才返回断点
+# 3. 中断：CAS 提交 → journal → 归档 → 成功后才返回断点
 checkpoint = agent.checkpoint(
     reason="token 预警",
     summary="完成 Xometry 只读探测器",
@@ -324,7 +337,7 @@ agent-projects init
 两个标准作业流程在 `skills/auto-dev-workflow/SKILL.md`：
 
 - `interrupted-task-recovery`：读记忆 → 校验状态机 → 按需读原文 → 恢复执行
-- `phase-completion-archive`：阶段完成 → 结构化写记忆 → 汇报
+- `phase-completion-archive`：阶段完成 → state CAS → 归档 → 清理 pending → 汇报
 
 ## 设计要点
 
@@ -332,17 +345,19 @@ agent-projects init
 断点要恢复的是「这个项目的进度」。如果状态在 A、记忆在 B，`resume()` 会拿 A 的
 `next_step` 去查 B 的历史，冲突时无法判断谁对。让两者共用 `root` 是最短的约束。
 
-**为什么断点必须先写记忆再输出？**
-断点输出是「已保存」的回执。反过来做，一旦进程被杀，聊天记录里的断点就是唯一副本，
-而聊天记录恰恰是最不可靠的存储。
+**为什么断点必须 CAS → 归档 → 才输出？**
+state CAS 是唯一提交点。先写记忆，CAS 失败会留下 orphan 断点；先输出，归档失败会
+让聊天记录成为唯一副本。固定顺序同时排除这两种失败。归档失败时 state 保持
+`archive_pending`，由 `resume()` / `retry_pending_checkpoint()` 补档。
 
 **为什么断点里要塞一行 JSON 标记？**
 自然语言断点恢复时要靠模型「猜」状态。机器标记让 `recover_from_memory()`
 可以精确重建 `TaskStatus / AccessMode / completed_steps`，不猜。
 
 **为什么本地状态和记忆都要写？**
-本地 `.longrun/state.json` 是热路径，快且原子；记忆是冷备份，跨机器、跨会话。
-两者冲突时以记忆中的断点为准，因为它经过用户可见的输出流程。
+本地 `.longrun/state.json` 是热路径，快且原子，也是恢复的权威；记忆是冷备份，
+跨机器、跨会话。恢复顺序是 `state → journal → memory`，不采用「最新记忆为准」，
+因为已提交的 state 可能比归档副本更新。
 
 **为什么默认只读？**
 调研阶段最常见的破坏是「还没想清楚就改」。门禁把「确认方案」变成一个必须显式执行的动作，
@@ -386,7 +401,7 @@ Agent-LongRun-Framework-v3/
 ├── memory_client.py        # 三种记忆后端（MCP / Local / InMemory），绑定项目根
 ├── workflow_manager.py     # LongRunAgent：start / checkpoint / resume / finish
 ├── cli.py                  # agent-longrun demo
-├── tests/                  # 73 个行为测试（1 skipped）
+├── tests/                  # 106 个行为测试（1 skipped）
 ├── examples/               # 中断恢复、阶段归档两个可运行示例
 ├── rules/                  # 四份可复用规则
 ├── skills/auto-dev-workflow/SKILL.md
@@ -396,51 +411,22 @@ Agent-LongRun-Framework-v3/
 └── README.zh-CN.md         # 简体中文
 ```
 
-## 安全与白帽挑战
+## 安全：已关闭的两个公开靶子
 
-V3 已修复 P0 的写门禁与状态文件并发问题（单轮写租约、跨进程 `state.lock`、
-唯一临时文件、`revision/CAS`）。下面公开两个更深层的 Agent 原生靶子，邀请白帽
-研究者来打。它们是设计级挑战，不代表当前代码已经安全。请先走私密渠道提交最小
-PoC；不要在公开 issue 里贴可直接运行的利用。
+V0.3 公开过两个 Agent 原生白帽靶子，V0.4 均已关闭：
 
-### 靶子 1 · 断点标记注入（悬赏）
+- **断点标记注入。** `checkpoint()` 会转义用户可见文本以及 marker JSON 中的
+  `<!--` / `-->`；`_parse_state_marker()` 只接受恰好一个 marker，多个 marker
+  一律不信任。回归测试：
+  `tests/test_v4_recovery.py::test_marker_injection_is_ignored`。
+- **CAS 失败后的 orphan 断点。** state CAS 现在是唯一提交点，memory 在 CAS 之后
+  才写；CAS 失败方既不写 memory，也不写 journal。回归测试：
+  `tests/test_target2_orphan_checkpoint.py::test_cas_conflict_writes_no_archive_and_recovery_uses_committed_checkpoint`。
 
-**不变量。** 一条 checkpoint 记录里只能有一个可信的机器状态标记。
-`recover_from_memory()` 必须恢复真实任务或报错，不能采用攻击者指定的标记。
-
-**挑战。** 只用公开 API，在 `task_desc`、`phase`、`summary`、`next_step`、
-`decisions` 中构造输入，使本地状态丢失后，`recover_from_memory()` 返回攻击者
-指定的 `task_id` 或 `next_step`。相关代码：`workflow_manager._render_checkpoint()`、
-`workflow_manager._STATE_MARKER_RE`、`LongRunAgent.recover_from_memory()`。
-
-**验收。** 最小 PoC + 一个在当前代码上失败、修复后通过的 pytest。附带具体修复
-方案者优先。
-
-### 靶子 2 · 断点孤儿（挑战）
-
-**不变量。** 未通过状态 CAS 的 checkpoint 记忆，不得在恢复时被当作有效断点。
-
-**场景。** 两个 Agent 同时 checkpoint：一个 CAS 成功，另一个失败；失败方的
-session 记录已经留在记忆库里。请给出可重复的时序，证明 `recover_from_memory()`
-会选中失败记录，或证明为什么不会。相关代码：`LongRunAgent.checkpoint()` 的 CAS
-提交、`LongRunAgent.recover_from_memory()` 的候选选择。
-
-**验收。** 最小并发时序 + 可重复的失败测试。能给出 commit proof / 幂等键设计的
-加分。
-
-### 奖励与报告
-
-- 奖励按提交质量协商（现金 / 项目 credit，可两者兼得）；在投入完整报告前，先在
-  私密渠道确认金额。
-- 通过 GitHub Security Advisories / Private vulnerability reporting 提交；修复前
-  请勿公开完整 PoC。
-- 我们争取 72 小时内确认，90 天内协调披露。披露后公开致谢。
-
-### 范围说明
-
-同机、同用户下能替换 `.longrun/state.lock` 或直接修改 `.longrun/state.json` 的
-进程，不在应用层威胁模型内。我们会用 inode 校验、`O_NOFOLLOW`、epoch 和部署
-隔离加固这条路径，但它不是本次悬赏靶子。
+如果发现 v0.4 仍可绕过，请通过 GitHub Security Advisories / Private
+vulnerability reporting 私下提交。同机、同用户下能替换
+`.longrun/state.lock` 或直接修改 `.longrun/state.json` 的进程，仍不在应用层
+威胁模型内。
 
 ## 测试
 
@@ -452,7 +438,12 @@ python -m pytest tests/ -q
 
 - 非法状态流转必须失败，终态无出口
 - `start_task` 第一次后端调用必须是 `search`
-- `checkpoint` 第一次后端调用必须是 `save`，失败则不返回断点
+- `checkpoint` 只在最后一次后端调用为 `save` 后返回；CAS 失败方不写 memory、
+  不写 journal
+- CAS 后归档失败时 state 保持 `archive_pending=true`，不返回断点；
+  `resume` / `retry_pending_checkpoint` 可从 archive、journal 或降级重渲染补档
+- 恢复顺序是 `state → journal → memory`；活动任务受保护，终态候选默认跳过，
+  同一任务取最高 `commit_seq`
 - 只读模式拦截写操作，`enable_writes` 后放行
 - `enable_writes` 只对当前轮有效，`begin_turn` / `end_turn` / `checkpoint` /
   `resume` / `recover_from_memory` 都会收回
