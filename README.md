@@ -25,7 +25,7 @@ precondition.
 > *may this turn touch files*. Conversation and execution are physically separated,
 > so the agent cannot keep editing after the approval expires.
 
-![agent-longrun demo](docs/demo.gif)
+![agent-longrun demo](docs/demo.gif?v=4.1)
 
 *`agent-longrun demo` — read-only → lease → checkpoint (state CAS → journal → archive) → resume → stale lease rejected → finish.*
 

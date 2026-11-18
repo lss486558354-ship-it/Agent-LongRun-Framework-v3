@@ -31,7 +31,7 @@
 > 之后才写 journal 与记忆归档；CAS 失败方不会留下 orphan 断点，
 > 归档失败则不输出断点。恢复顺序固定为 `state → journal → memory`。
 
-![agent-longrun demo](docs/demo.gif)
+![agent-longrun demo](docs/demo.gif?v=4.1)
 
 *`agent-longrun demo`：只读 → 授权 → 断点（state CAS → journal → 归档）→ 恢复 → 租约失效 → 重新授权。*
 
